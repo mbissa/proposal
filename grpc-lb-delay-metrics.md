@@ -9,32 +9,32 @@ Load Balancer Pick Queue Delay Observability
 
 ## Abstract
 
-This proposal introduces observability for the duration that RPCs spend waiting in the gRPC client channel waiting for a load balancing pick to complete. Today, when a picker indicates that no subchannel is available, the client channel then defers the RPC (either by queueing it or blocking the caller) until the LB policy provides a new picker or the RPC context is canceled/times out. This latency is invisible to operators, making it difficult to diagnose which layer of the LB policy tree is causing the delay.
+This proposal introduces observability for the duration that RPCs spend waiting in the gRPC client channel for a load balancing pick to complete. Today, when a picker indicates that no subchannel is available, the client channel then defers the RPC (either by waiting or blocking the caller) until the LB policy provides a new picker or the RPC context is canceled/times out. This latency is invisible to operators, making it difficult to diagnose which layer of the LB policy tree is causing the delay.
 
 This gRFC defines:
-1. A new histogram metric (`grpc.lb.pick_queue_duration`) recorded by the client
-   channel, with bounded `grpc.lb.queue_reason` and optional `grpc.method`
-   labels. The histogram emits one observation per queue reason segment,
+1. A new histogram metric (`grpc.lb.pick_delay_duration`) recorded by the client
+   channel, with bounded `grpc.lb.delay_reason` and optional `grpc.method`
+   labels. The histogram emits one observation per delay reason segment,
    providing per-layer delay breakdown when an RPC transitions through multiple
    LB policy states.
-2. A new up-down counter metric (`grpc.lb.pick_queue_active`) tracking the
-   number of RPCs currently queued, providing visibility into stuck traffic.
+2. A new up-down counter metric (`grpc.lb.rpc_waiting`) tracking the
+   number of RPCs currently waiting, providing visibility into stuck traffic.
 3. An enhancement to the existing "Delayed LB pick complete" span event ([A72])
-   to include the queue reason and queue duration as span event attributes.
-4. API changes in each language to allow pickers to expose the queue reason as a
+   to include the delay reason and delay duration as span event attributes.
+4. API changes in each language to allow pickers to expose the delay reason as a
    bounded, pre-computed string token, with support for both picker-level tokens
    (uniform policies) and per-pick tokens (RLS, cluster_manager).
 
 ## Background
 
 gRPC uses a tree of load balancing policies to select a subchannel for each RPC.
-When no suitable subchannel is available, the picker indicates this state to the client channel. The client channel then defers the RPC (either by queueing it or blocking the caller) until the LB policy provides a new picker or the RPC's context is canceled or times out.
+When no suitable subchannel is available, the picker indicates this state to the client channel. The client channel then defers the RPC (either by waiting or blocking the caller) until the LB policy provides a new picker or the RPC's context is canceled or times out.
 Operators currently have no visibility into:
-- **How long** RPCs are queued.
-- **Why** they are queued (which policy in the tree caused it).
+- **How long** RPCs wait.
+- **Why** they are delayed (which policy in the tree caused it).
 
-The existing `grpc.client.attempt.duration` metric (A66) includes queue time but
-does not isolate it, and provides no information about the queueing cause.
+The existing `grpc.client.attempt.duration` metric (A66) includes pick delay but
+does not isolate it, and provides no information about the cause of the delay.
 
 ### Related Proposals
 
@@ -55,12 +55,12 @@ does not isolate it, and provides no information about the queueing cause.
 ## Proposal
 
 Using [A79]'s non-per-call metrics architecture and [A72]'s tracing framework,
-we will add a histogram metric, an active queue gauge, and enhanced trace span
-event that measure the time each RPC spends queued waiting for a load balancing
+we will add a histogram metric, an active waiting RPC counter, and enhanced trace span
+event that measure the time each RPC spends waiting for a load balancing
 pick.
 
-Each LB policy's picker provides a bounded string **queue reason token**
-describing why it would queue RPCs (e.g., `"pick_first:connecting"`). For
+Each LB policy's picker provides a bounded string **delay reason token**
+describing why it would delay RPCs (e.g., `"pick_first:connecting"`). For
 policies with uniform picker state (pick_first, round_robin, ring_hash,
 priority), the token is pre-computed at picker construction time. For policies
 that make per-request routing decisions (RLS, cluster_manager), the token is
@@ -68,12 +68,12 @@ determined inside `Pick()` and varies per-RPC. Delegating policies compose
 tokens by prepending their own prefix to their child picker's token (e.g.,
 `"priority_p0:pick_first:connecting"`).
 
-The client channel's pick-queueing loop reads this token from the picker when a
-pick is queued, records the queue start time, and emits one histogram
-observation per queue reason segment — if the token changes during the wait
+The client channel's pick loop reads this token from the picker when a
+pick is delayed, records the delay start time, and emits one histogram
+observation per delay reason segment — if the token changes during the wait
 (e.g., an RLS lookup completes, causing a transition from `rls:lookup_pending`
 to `rls:pick_first:connecting`), the current segment is closed and a new one
-begins. An up-down counter tracks how many RPCs are currently queued,
+begins. An up-down counter tracks how many RPCs are currently waiting,
 providing visibility into stuck traffic that has not yet emitted a histogram
 observation.
 
@@ -91,11 +91,11 @@ defined in [A79][A79].
 
 | Field | Value |
 |---|---|
-| **Name** | `grpc.lb.pick_queue_duration` |
+| **Name** | `grpc.lb.pick_delay_duration` |
 | **Type** | Float64 Histogram |
 | **Unit** | `s` (seconds) |
-| **Description** | EXPERIMENTAL. Time an RPC spent queued waiting for a load balancing pick, broken down by the reason for queueing. |
-| **Labels** | `grpc.target`, `grpc.lb.queue_reason` |
+| **Description** | EXPERIMENTAL. Time an RPC spent waiting for a load balancing pick, broken down by the reason for the delay. |
+| **Labels** | `grpc.target`, `grpc.lb.delay_reason` |
 | **Optional Labels** | `grpc.method` |
 | **Bucket Boundaries** | Same as A66 latency buckets: 0, 0.00001, 0.00005, 0.0001, 0.0003, 0.0006, 0.0008, 0.001, 0.002, 0.003, 0.004, 0.005, 0.006, 0.008, 0.01, 0.013, 0.016, 0.02, 0.025, 0.03, 0.04, 0.05, 0.065, 0.08, 0.1, 0.13, 0.16, 0.2, 0.25, 0.3, 0.4, 0.5, 0.65, 0.8, 1, 2, 5, 10, 20, 50, 100 |
 | **Default Enabled** | `false` (experimental, opt-in) |
@@ -109,29 +109,29 @@ defined in [A79][A79].
 > operators can override the aggregation strategy to exponential using
 > OpenTelemetry SDK Views at the application level.
 
-If the queue reason token changes during the wait (e.g., due to an RLS lookup
+If the delay reason token changes during the wait (e.g., due to an RLS lookup
 completing or a priority failover), the recording loop emits one histogram
-observation **per queue reason segment**. A segment ends when a new picker
-arrives with a different token, or when the queue wait ends. A single RPC may
+observation **per delay reason segment**. A segment ends when a new picker
+arrives with a different token, or when the wait ends. A single RPC may
 therefore contribute multiple histogram observations, each covering the time
-spent under a specific queue reason. This per-segment approach gives operators
+spent under a specific delay reason. This per-segment approach gives operators
 visibility into how much time each layer of the LB policy tree contributed to
-the total queue delay.
+the total pick delay.
 
 The following gauge metric is also registered to provide visibility into RPCs
-that are currently queued and have not yet emitted a histogram observation:
+that are currently waiting and have not yet emitted a histogram observation:
 
 | Field | Value |
 |---|---|
-| **Name** | `grpc.lb.pick_queue_active` |
+| **Name** | `grpc.lb.rpc_waiting` |
 | **Type** | Int64 UpDownCounter |
 | **Unit** | `{call}` |
-| **Description** | EXPERIMENTAL. Number of RPCs currently queued waiting for a load balancing pick. |
+| **Description** | EXPERIMENTAL. Number of RPCs currently waiting for a load balancing pick. |
 | **Labels** | `grpc.target` |
 | **Default Enabled** | `false` (experimental, opt-in) |
 
-The counter is incremented (`+1`) when a pick is first queued and decremented
-(`-1`) when the queue wait ends (successful pick or cancellation). This matches
+The counter is incremented (`+1`) when a pick is first deferred and decremented
+(`-1`) when the wait ends (successful pick or cancellation). This matches
 the pattern used by `grpc.subchannel.open_connections` ([A94]) and
 `grpc.tcp.connection_count` ([A80]).
 
@@ -140,12 +140,12 @@ the pattern used by `grpc.subchannel.open_connections` ([A94]) and
 | Label | Type | Description |
 |---|---|---|
 | `grpc.target` | String | The target URI of the channel. Required. |
-| `grpc.lb.queue_reason` | String | The bounded queue reason token from the picker. Optional label. |
-| `grpc.method` | String | The full method name of the RPC (e.g., `/pkg.Service/Method`). Optional label. Available from `PickInfo` at queue time. Primarily useful for policies like RLS where queue behavior varies by method. |
+| `grpc.lb.delay_reason` | String | The bounded delay reason token from the picker. Optional label. |
+| `grpc.method` | String | The full method name of the RPC (e.g., `/pkg.Service/Method`). Optional label. Available from `PickInfo` at pick time. Primarily useful for policies like RLS where wait behavior varies by method. |
 
-### Queue Reason Token Semantics
+### Delay Reason Token Semantics
 
-Queue reason tokens are static, bounded strings following the grammar:
+Delay reason tokens are static, bounded strings following the grammar:
 
 ```
 token       = terminal | prefix ":" token
@@ -201,13 +201,13 @@ empty string `""`, and the pick completes without queueing.
 #### Per-Pick Tokens
 
 Some policies make per-request routing decisions within `Pick()`, causing the
-queue reason to vary across RPCs handled by the same picker. These policies
-provide their token via the queue result rather than a picker-level method:
+delay reason to vary across RPCs handled by the same picker. These policies
+provide their token via the pick result rather than a picker-level method:
 
 - **RLS**: A single `rlsPicker` performs a per-request cache lookup. A cache
-  miss queues with `rls:lookup_pending`, while a cache hit that delegates to a
-  child in CONNECTING state queues with `rls:pick_first:connecting`. The token
-  must be determined inside `Pick()` and attached to the queue result.
+  miss delays with `rls:lookup_pending`, while a cache hit that delegates to a
+  child in CONNECTING state delays with `rls:pick_first:connecting`. The token
+  must be determined inside `Pick()` and attached to the pending result.
 
 - **cluster_manager**: Routes RPCs to different child pickers based on the
   cluster selected by xDS routing. Different RPCs may reach different child
@@ -232,58 +232,58 @@ implement:
 ```go
 // In package balancer
 
-// QueueMetricTokener is an optional interface that Pickers can implement
-// to provide a bounded metric token describing why this picker queues RPCs.
+// DelayMetricTokener is an optional interface that Pickers can implement
+// to provide a bounded metric token describing why this picker delays RPCs.
 // The token MUST be a static, pre-computed string with no dynamic components.
-type QueueMetricTokener interface {
-    // QueueMetricToken returns the bounded queue reason token.
-    // Returns "" if the picker does not queue RPCs.
-    QueueMetricToken() string
+type DelayMetricTokener interface {
+    // DelayMetricToken returns the bounded delay reason token.
+    // Returns "" if the picker does not delay RPCs.
+    DelayMetricToken() string
 }
 ```
 
-**Per-pick token** — for policies where the queue reason varies per-RPC (RLS,
+**Per-pick token** — for policies where the delay reason varies per-RPC (RLS,
 cluster_manager). A structured error type that wraps `ErrNoSubConnAvailable`
 with a token:
 
 ```go
 // In package balancer
 
-// QueueError is returned by Pick() to signal queueing with a per-pick
+// PendingPickError is returned by Pick() to signal a delay with a per-pick
 // metric token. It is equivalent to ErrNoSubConnAvailable but carries
-// a queue reason token that may vary per-RPC.
-type QueueError struct {
-    // MetricToken is the bounded queue reason token for this specific pick.
+// a delay reason token that may vary per-RPC.
+type PendingPickError struct {
+    // MetricToken is the bounded delay reason token for this specific pick.
     MetricToken string
 }
 
-func (e *QueueError) Error() string { return "no SubConn available" }
-func (e *QueueError) Is(target error) bool {
+func (e *PendingPickError) Error() string { return "no SubConn available" }
+func (e *PendingPickError) Is(target error) bool {
     return target == ErrNoSubConnAvailable
 }
 ```
 
 The recording loop resolves the token with the following precedence: if the
-error is a `*QueueError`, use its `MetricToken`; otherwise, check whether the
-picker implements `QueueMetricTokener`; otherwise, use the empty string.
+error is a `*PendingPickError`, use its `MetricToken`; otherwise, check whether the
+picker implements `DelayMetricTokener`; otherwise, use the empty string.
 
 Built-in pickers (`pick_first`, `round_robin`, `ring_hash`, `priority`, etc.)
-implement `QueueMetricTokener`. Custom LB policies that implement neither
+implement `DelayMetricTokener`. Custom LB policies that implement neither
 mechanism report an empty token.
 
 **Example — `pick_first` (picker-level):**
 ```go
 type pfPicker struct {
     subConn    balancer.SubConn
-    queueToken string // set at construction: "pick_first:connecting" or ""
+    delayToken string // set at construction: "pick_first:connecting" or ""
 }
 
 func (p *pfPicker) Pick(balancer.PickInfo) (balancer.PickResult, error) {
     return balancer.PickResult{SubConn: p.subConn}, nil
 }
 
-func (p *pfPicker) QueueMetricToken() string {
-    return p.queueToken
+func (p *pfPicker) DelayMetricToken() string {
+    return p.delayToken
 }
 ```
 
@@ -295,15 +295,15 @@ func (p *rlsPicker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
     case dcEntry == nil && pendingEntry == nil:
         p.sendRouteLookupRequest(cacheKey, ...)
         return balancer.PickResult{},
-            &balancer.QueueError{MetricToken: "rls:lookup_pending"}
+            &balancer.PendingPickError{MetricToken: "rls:lookup_pending"}
     case dcEntry == nil && pendingEntry != nil:
         return balancer.PickResult{},
-            &balancer.QueueError{MetricToken: "rls:lookup_pending"}
+            &balancer.PendingPickError{MetricToken: "rls:lookup_pending"}
     case dcEntry != nil:
         // Delegate to child policy — child's Pick() may return its
-        // own QueueError or ErrNoSubConnAvailable.
+        // own PendingPickError or ErrNoSubConnAvailable.
         pr, err := childPicker.Pick(info)
-        if qe, ok := err.(*balancer.QueueError); ok {
+        if qe, ok := err.(*balancer.PendingPickError); ok {
             qe.MetricToken = "rls:" + qe.MetricToken
         }
         return pr, err
@@ -315,11 +315,11 @@ func (p *rlsPicker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
 ```go
 type priorityPicker struct {
     childPicker balancer.Picker
-    queueToken  string // e.g., "priority_p0:" + childToken
+    delayToken  string // e.g., "priority_p0:" + childToken
 }
 
-func (p *priorityPicker) QueueMetricToken() string {
-    return p.queueToken
+func (p *priorityPicker) DelayMetricToken() string {
+    return p.delayToken
 }
 ```
 
@@ -327,23 +327,23 @@ func (p *priorityPicker) QueueMetricToken() string {
 
 Java's `PickResult` is `final` and `@Immutable`. The per-pick token is carried
 on the `PickResult` itself via a new factory method, which naturally supports
-policies like RLS where the queue reason varies per-RPC. The `SubchannelPicker`
+policies like RLS where the delay reason varies per-RPC. The `SubchannelPicker`
 also gets a default method for delegating policies that have uniform state:
 
 ```java
 // In LoadBalancer.PickResult
 
 // New field (private, immutable)
-@Nullable private final String queueMetricToken;
+@Nullable private final String delayMetricToken;
 
-// New factory method for queue results with a reason token
-public static PickResult withNoResult(String queueMetricToken) {
-    return new PickResult(null, null, Status.OK, false, null, queueMetricToken);
+// New factory method for delayed results with a reason token
+public static PickResult withNoResult(String delayMetricToken) {
+    return new PickResult(null, null, Status.OK, false, null, delayMetricToken);
 }
 
 // Getter
-public String getQueueMetricToken() {
-    return queueMetricToken != null ? queueMetricToken : "";
+public String getDelayMetricToken() {
+    return delayMetricToken != null ? delayMetricToken : "";
 }
 ```
 
@@ -355,27 +355,27 @@ delegating policies to read the child's token:
 // In LoadBalancer.SubchannelPicker
 
 /**
- * Returns the bounded metric token describing why this picker queues RPCs.
- * Default returns empty string (no queueing information).
+ * Returns the bounded metric token describing why this picker delays RPCs.
+ * Default returns empty string (no delay information).
  */
-public String getQueueMetricToken() { return ""; }
+public String getDelayMetricToken() { return ""; }
 ```
 
 **Example implementation in `PickFirstLeafLoadBalancer`:**
 ```java
 private class Picker extends SubchannelPicker {
-    private final String queueMetricToken;
+    private final String delayMetricToken;
 
-    Picker(String token) { this.queueMetricToken = token; }
+    Picker(String token) { this.delayMetricToken = token; }
 
     @Override
     public PickResult pickSubchannel(PickSubchannelArgs args) {
-        // When queueing, use the token-aware factory:
-        return PickResult.withNoResult(queueMetricToken);
+        // When delaying, use the token-aware factory:
+        return PickResult.withNoResult(delayMetricToken);
     }
 
     @Override
-    public String getQueueMetricToken() { return queueMetricToken; }
+    public String getDelayMetricToken() { return delayMetricToken; }
 }
 ```
 
@@ -462,14 +462,14 @@ class PriorityPicker final : public SubchannelPicker {
 
 ### Language-Specific Recording Logic
 
-Recording is performed by the client channel's pick-queueing infrastructure, not
+Recording is performed by the client channel's pick deferring infrastructure, not
 by the LB policy itself. The LB policy provides the token; the channel measures
 time and records the metric.
 
 #### Go — `picker_wrapper.go`
 
 In the `pick()` method's blocking loop, the recording logic resolves the token
-from either a `QueueError` or the `QueueMetricTokener` interface, and emits a
+from either a `PendingPickError` or the `DelayMetricTokener` interface, and emits a
 histogram observation each time the token changes (per-segment emission):
 
 ```go
@@ -486,26 +486,26 @@ func (pw *pickerWrapper) pick(ctx context.Context, failfast bool,
         pickResult, err := p.Pick(info)
         if err != nil {
             if errors.Is(err, balancer.ErrNoSubConnAvailable) {
-                // Resolve per-pick token from QueueError, or fall
-                // back to picker-level QueueMetricTokener.
+                // Resolve per-pick token from PendingPickError, or fall
+                // back to picker-level DelayMetricTokener.
                 currentToken := ""
-                if qe, ok := err.(*balancer.QueueError); ok {
+                if qe, ok := err.(*balancer.PendingPickError); ok {
                     currentToken = qe.MetricToken
-                } else if qt, ok := p.(balancer.QueueMetricTokener); ok {
-                    currentToken = qt.QueueMetricToken()
+                } else if qt, ok := p.(balancer.DelayMetricTokener); ok {
+                    currentToken = qt.DelayMetricToken()
                 }
 
                 if !queued {
-                    // First queue event — start timing, increment counter.
+                    // First delay event — start timing, increment counter.
                     queued = true
                     queueStartTime = time.Now()
                     queueToken = currentToken
-                    pickQueueActiveMetric.Record(metricsRecorder, 1, target)
+                    rpcWaitingMetric.Record(metricsRecorder, 1, target)
                 } else if currentToken != queueToken {
                     // Token changed (new picker with different state).
                     // Emit segment for the previous token.
                     duration := time.Since(queueStartTime).Seconds()
-                    pickQueueDurationMetric.Record(metricsRecorder,
+                    pickDelayDurationMetric.Record(metricsRecorder,
                         duration, target, queueToken, method)
                     // Start new segment.
                     queueStartTime = time.Now()
@@ -516,16 +516,16 @@ func (pw *pickerWrapper) pick(ctx context.Context, failfast bool,
             // ... existing error handling ...
         }
 
-        // Pick succeeded. If we were queued, record final segment.
+        // Pick succeeded. If we were delayed, record final segment.
         if queued {
             duration := time.Since(queueStartTime).Seconds()
-            pickQueueDurationMetric.Record(metricsRecorder,
+            pickDelayDurationMetric.Record(metricsRecorder,
                 duration, target, queueToken, method)
-            pickQueueActiveMetric.Record(metricsRecorder, -1, target)
+            rpcWaitingMetric.Record(metricsRecorder, -1, target)
             if attemptSpan != nil {
                 attemptSpan.AddEvent("Delayed LB pick complete",
-                    attribute.Float64("queue_duration", duration),
-                    attribute.String("queue_reason", queueToken))
+                    attribute.Float64("delay_duration", duration),
+                    attribute.String("delay_reason", queueToken))
             }
         }
         // ... existing transport handling ...
@@ -539,13 +539,13 @@ recording logic applies:
 case <-ctx.Done():
     if queued {
         duration := time.Since(queueStartTime).Seconds()
-        pickQueueDurationMetric.Record(metricsRecorder,
+        pickDelayDurationMetric.Record(metricsRecorder,
             duration, target, queueToken, method)
-        pickQueueActiveMetric.Record(metricsRecorder, -1, target)
+        rpcWaitingMetric.Record(metricsRecorder, -1, target)
         if attemptSpan != nil {
             attemptSpan.AddEvent("Delayed LB pick complete",
-                attribute.Float64("queue_duration", duration),
-                attribute.String("queue_reason", queueToken))
+                attribute.Float64("delay_duration", duration),
+                attribute.String("delay_reason", queueToken))
         }
     }
     // ... existing error return ...
@@ -556,16 +556,16 @@ the `pickerWrapper`.
 
 #### Java — `DelayedClientTransport.java`
 
-When a `PendingStream` is created in `createPendingStream()`, the queue start
+When a `PendingStream` is created in `createPendingStream()`, the delay start
 time and token are captured:
 
 ```java
 private PendingStream createPendingStream(PickSubchannelArgs args,
     ClientStreamTracer[] tracers, PickResult pickResult) {
     PendingStream pendingStream = new PendingStream(args, tracers);
-    pendingStream.queueStartNanos = System.nanoTime();
-    pendingStream.queueToken = (pickerState.lastPicker != null)
-        ? pickerState.lastPicker.getQueueMetricToken() : "";
+    pendingStream.delayStartNanos = System.nanoTime();
+    pendingStream.delayToken = (pickerState.lastPicker != null)
+        ? pickerState.lastPicker.getDelayMetricToken() : "";
     // ... existing logic ...
 }
 ```
@@ -575,14 +575,14 @@ the duration is recorded:
 
 ```java
 if (transport != null) {
-    long durationNanos = System.nanoTime() - stream.queueStartNanos;
+    long durationNanos = System.nanoTime() - stream.delayStartNanos;
     double durationSeconds = durationNanos / 1_000_000_000.0;
-    metricsRecorder.recordPickQueueDuration(durationSeconds,
-        target, stream.queueToken);
+    metricsRecorder.recordPickDelayDuration(durationSeconds,
+        target, stream.delayToken);
     stream.getTracer().recordAnnotation("Delayed LB pick complete",
         Attributes.of(
-            "queue_duration", durationSeconds,
-            "queue_reason", stream.queueToken));
+            "delay_duration", durationSeconds,
+            "delay_reason", stream.delayToken));
     // ... existing stream creation ...
 }
 ```
@@ -596,23 +596,23 @@ duration is recorded:
 ```cpp
 // In the pick processing lambda (simplified):
 auto queue_func = [&](LoadBalancingPolicy::PickResult::Queue* queue_pick) {
-    if (!queue_start_time.has_value()) {
-        queue_start_time = Timestamp::Now();
-        queue_token = std::string(queue_pick->metric_token);
+    if (!delay_start_time.has_value()) {
+        delay_start_time = Timestamp::Now();
+        delay_token = std::string(queue_pick->metric_token);
     }
     return Continue{};
 };
 
 // On successful pick (in the completion callback):
-if (queue_start_time.has_value()) {
-    Duration queue_duration = Timestamp::Now() - *queue_start_time;
+if (delay_start_time.has_value()) {
+    Duration delay_duration = Timestamp::Now() - *delay_start_time;
     stats_plugin_group.RecordHistogram(
-        kPickQueueDurationHandle,
-        queue_duration.seconds(),
-        {target}, {queue_token});
+        kPickDelayDurationHandle,
+        delay_duration.seconds(),
+        {target}, {delay_token});
     call_tracer->RecordAnnotation("Delayed LB pick complete", {
-        {"queue_duration", absl::StrCat(queue_duration.seconds())},
-        {"queue_reason", queue_token}
+        {"delay_duration", absl::StrCat(delay_duration.seconds())},
+        {"delay_reason", delay_token}
     });
 }
 ```
@@ -626,10 +626,10 @@ Unlike static policies (like `pick_first`), the RLS policy in C-Core evaluates t
 *   **The C-Core Constraint:** The `PickResult::Queue` struct uses an `absl::string_view` to prevent allocations on the hot path. However, because an RLS cache miss is dynamic, the string it points to must safely outlive the pick.
 *   **Implementation:** The RLS LB Policy must maintain a static, pre-allocated pool of `std::string` constants for its state transitions (e.g., `static const std::string kRlsPending = "rls:lookup_pending";`). During a cache miss `Pick()`, the policy returns a `string_view` pointing explicitly to this constant memory address, ensuring safe reference lifecycle without dynamic memory allocation per RPC.
 
-**2. MAX_CONCURRENT_STREAMS (Transport-Level Queueing)**
-In C-Core, queueing can occur even when the LB Policy successfully finds a `READY` subchannel. If the HTTP/2 transport for that subchannel has reached its `SETTINGS_MAX_CONCURRENT_STREAMS` limit, the `grpc_call` must be queued.
-*   **The Distinction:** This is a *transport* queue, not an *LB routing* queue.
-*   **Implementation:** The LB policy's `Pick()` method will actually succeed and return a `READY` subchannel. However, the `client_channel` filter will detect the transport exhaustion. To maintain observability, the `client_channel` filter itself will inject a synthetic token: `"transport:max_concurrent_streams"`. The queue timer will start, and the RPC will wait in the filter's pending list until a stream becomes available or the context deadline is exceeded. This clearly separates network capacity limits from LB routing failures in the resulting telemetry.
+**2. MAX_CONCURRENT_STREAMS (Transport-Level Delay)**
+In C-Core, waiting can occur even when the LB Policy successfully finds a `READY` subchannel. If the HTTP/2 transport for that subchannel has reached its `SETTINGS_MAX_CONCURRENT_STREAMS` limit, the `grpc_call` must wait.
+*   **The Distinction:** This is a *transport* delay, not an *LB routing* delay.
+*   **Implementation:** The LB policy's `Pick()` method will actually succeed and return a `READY` subchannel. However, the `client_channel` filter will detect the transport exhaustion. To maintain observability, the `client_channel` filter itself will inject a synthetic token: `"transport:max_concurrent_streams"`. The delay timer will start, and the RPC will wait in the filter's pending list until a stream becomes available or the context deadline is exceeded. This clearly separates network capacity limits from LB routing failures in the resulting telemetry.
 
 ### Metric Instrument Registration
 
@@ -638,22 +638,22 @@ In C-Core, queueing can occur even when the LB Policy successfully finds a `READ
 ```go
 import estats "google.golang.org/grpc/experimental/stats"
 
-var pickQueueDurationMetric = estats.RegisterFloat64Histo(
+var pickDelayDurationMetric = estats.RegisterFloat64Histo(
     estats.MetricDescriptor{
-        Name:           "grpc.lb.pick_queue_duration",
-        Description:    "EXPERIMENTAL. Time an RPC spent queued waiting " +
+        Name:           "grpc.lb.pick_delay_duration",
+        Description:    "EXPERIMENTAL. Time an RPC spent waiting " +
                         "for a load balancing pick.",
         Unit:            "s",
-        Labels:          []string{"grpc.target", "grpc.lb.queue_reason"},
+        Labels:          []string{"grpc.target", "grpc.lb.delay_reason"},
         OptionalLabels: []string{"grpc.method"},
         Default:        false,
     })
 
-var pickQueueActiveMetric = estats.RegisterInt64UpDownCount(
+var rpcWaitingMetric = estats.RegisterInt64UpDownCount(
     estats.MetricDescriptor{
-        Name:           "grpc.lb.pick_queue_active",
-        Description:    "EXPERIMENTAL. Number of RPCs currently queued " +
-                        "waiting for a load balancing pick.",
+        Name:           "grpc.lb.rpc_waiting",
+        Description:    "EXPERIMENTAL. Number of RPCs currently waiting " +
+                        "for a load balancing pick.",
         Unit:           "{call}",
         Labels:         []string{"grpc.target"},
         Default:        false,
@@ -663,21 +663,21 @@ var pickQueueActiveMetric = estats.RegisterInt64UpDownCount(
 #### Java
 
 ```java
-private static final LongHistogramInstrumentDescriptor PICK_QUEUE_DURATION =
+private static final LongHistogramInstrumentDescriptor PICK_DELAY_DURATION =
     InstrumentRegistry.registerDoubleHistogram(
-        "grpc.lb.pick_queue_duration",
-        "EXPERIMENTAL. Time an RPC spent queued waiting "
+        "grpc.lb.pick_delay_duration",
+        "EXPERIMENTAL. Time an RPC spent waiting "
             + "for a load balancing pick.",
         "s",
-        List.of("grpc.target", "grpc.lb.queue_reason"),  // required labels
+        List.of("grpc.target", "grpc.lb.delay_reason"),  // required labels
         List.of("grpc.method"),                           // optional labels
         false);                                          // default disabled
 
-private static final LongUpDownCounterMetricInstrument PICK_QUEUE_ACTIVE =
+private static final LongUpDownCounterMetricInstrument RPC_WAITING =
     InstrumentRegistry.registerLongUpDownCounter(
-        "grpc.lb.pick_queue_active",
-        "EXPERIMENTAL. Number of RPCs currently queued "
-            + "waiting for a load balancing pick.",
+        "grpc.lb.rpc_waiting",
+        "EXPERIMENTAL. Number of RPCs currently waiting "
+            + "for a load balancing pick.",
         "{call}",
         List.of("grpc.target"),
         List.of(),
@@ -687,21 +687,21 @@ private static final LongUpDownCounterMetricInstrument PICK_QUEUE_ACTIVE =
 #### C++ (Core)
 
 ```cpp
-const auto kPickQueueDurationHandle =
+const auto kPickDelayDurationHandle =
     GlobalInstrumentsRegistry::RegisterDoubleHistogram(
-        "grpc.lb.pick_queue_duration",
-        "EXPERIMENTAL. Time an RPC spent queued waiting "
+        "grpc.lb.pick_delay_duration",
+        "EXPERIMENTAL. Time an RPC spent waiting "
         "for a load balancing pick.",
         "s",
-        /*label_keys=*/{"grpc.target", "grpc.lb.queue_reason"},
+        /*label_keys=*/{"grpc.target", "grpc.lb.delay_reason"},
         /*optional_label_keys=*/{"grpc.method"},
         /*enable_by_default=*/false);
 
-const auto kPickQueueActiveHandle =
+const auto kRpcWaitingHandle =
     GlobalInstrumentsRegistry::RegisterUpDownInt64Counter(
-        "grpc.lb.pick_queue_active",
-        "EXPERIMENTAL. Number of RPCs currently queued "
-        "waiting for a load balancing pick.",
+        "grpc.lb.rpc_waiting",
+        "EXPERIMENTAL. Number of RPCs currently waiting "
+        "for a load balancing pick.",
         "{call}",
         /*label_keys=*/{"grpc.target"},
         /*optional_label_keys=*/{},
@@ -721,7 +721,7 @@ in all three languages, with at least one release cycle of user feedback.
 ### Temporary environment variable protection
 
 The metric will be guarded by the environment variable
-`GRPC_EXPERIMENTAL_ENABLE_PICK_QUEUE_METRIC`. When set to `true`, the metric
+`GRPC_EXPERIMENTAL_ENABLE_PICK_DELAY_METRIC`. When set to `true`, the metric
 will be registered and reported even if the user has not explicitly enabled it
 via the OpenTelemetry plugin configuration. This guard will be removed once the
 feature is deemed stable.
@@ -734,55 +734,55 @@ carries no attributes. This proposal enhances it with the following attributes:
 
 | Attribute Key | Type | Description |
 |---|---|---|
-| `queue_duration` | double | The queue wait duration in seconds. |
-| `queue_reason` | string | The queue reason token from the picker. |
+| `delay_duration` | double | The wait duration in seconds. |
+| `delay_reason` | string | The delay reason token from the picker. |
 
-The event is emitted at the point where the queue wait ends (successful pick or
+The event is emitted at the point where the wait ends (successful pick or
 cancellation), on the attempt span. The attribute values come from the same
-queue start time and token already captured for the metric.
+delay start time and token already captured for the metric.
 
 This enhancement is additive to [A72] — the event name remains "Delayed LB pick
-complete" and the event is still emitted only when the RPC experienced queueing.
+complete" and the event is still emitted only when the RPC experienced delay.
 The only change is the addition of attributes. If tracing is not configured via
 the OpenTelemetry plugin, no span events are emitted and there is no overhead.
 
 ## Rationale
 
-The metric is recorded by the client channel's pick-queueing infrastructure
+The metric is recorded by the client channel's pick deferring infrastructure
 rather than by the LB policy itself, because the LB policy knows its internal
 state but does not know how many RPCs are waiting or for how long. Only the
-channel physically buffers RPCs and can accurately measure per-RPC queue
+channel physically buffers RPCs and can accurately measure per-RPC delay
 duration. This mirrors the existing design where per-call metrics ([A66]) are
 recorded by the channel, not by LB policies.
 
-Two mechanisms are provided for supplying queue reason tokens — a picker-level
-optional interface (`QueueMetricTokener`) and a per-pick error/result type
-(`QueueError` / `PickResult.withNoResult(token)` / `Queue::metric_token`). Most
-LB policies have uniform picker state: all RPCs see the same queue reason from a
+Two mechanisms are provided for supplying delay reason tokens — a picker-level
+optional interface (`DelayMetricTokener`) and a per-pick error/result type
+(`PendingPickError` / `PickResult.withNoResult(token)` / `Queue::metric_token`). Most
+LB policies have uniform picker state: all RPCs see the same delay reason from a
 given picker instance (pick_first, round_robin, ring_hash, priority). These
 policies use the picker-level mechanism, which involves zero allocations on the
 pick path. However, RLS and cluster_manager make per-request routing decisions
 within `Pick()` — RLS does a per-request cache lookup, and cluster_manager
 routes RPCs to different child pickers based on the xDS-selected cluster. For
-these policies, the queue reason varies per-RPC, requiring the token to be
-determined inside `Pick()` and attached to the queue result.
+these policies, the delay reason varies per-RPC, requiring the token to be
+determined inside `Pick()` and attached to the pending result.
 
-The recording loop emits one histogram observation per queue reason segment
+The recording loop emits one histogram observation per delay reason segment
 rather than a single observation per RPC. An RPC that transitions through
-multiple queue reasons (e.g., `rls:lookup_pending` for 10 seconds, then
+multiple delay reasons (e.g., `rls:lookup_pending` for 10 seconds, then
 `rls:pick_first:connecting` for 0.1 seconds after the lookup completes) produces
 two histogram observations, one for each segment. This per-segment approach
 provides visibility into how much time each layer of the LB policy tree
-contributed to the total queue delay. Without it, a single 10.1-second
+contributed to the total pick delay. Without it, a single 10.1-second
 observation attributed to `rls:lookup_pending` would obscure the fact that the
 RLS lookup accounted for the vast majority of the delay.
 
-The `grpc.lb.pick_queue_active` up-down counter is provided because the
-histogram metric is emitted only when a queue wait ends. RPCs that are
-indefinitely stuck in the queue (e.g., target unreachable, infinite backoff)
+The `grpc.lb.rpc_waiting` up-down counter is provided because the
+histogram metric is emitted only when a wait ends. RPCs that are
+indefinitely delayed (e.g., target unreachable, infinite backoff)
 never emit a histogram observation. The counter gives operators a real-time
-count of currently-queued RPCs, enabling alerting on stuck traffic. Every LB
-policy in the tree can cause indefinite queueing (pick_first cycling through
+count of currently-waiting RPCs, enabling alerting on stuck traffic. Every LB
+policy in the tree can cause indefinite waiting (pick_first cycling through
 CONNECTING/TF, RLS server unreachable, CDS resource never arriving), making this
 counter essential. An up-down counter is used rather than a callback gauge
 because the recording loop has the exact synchronous entry/exit points, matching
@@ -790,25 +790,25 @@ the pattern used by `grpc.subchannel.open_connections` ([A94]) and
 `grpc.tcp.connection_count` ([A80]).
 
 `grpc.method` is included as an optional label because some policies (RLS,
-cluster_manager) make routing decisions based on the method name, causing queue
+cluster_manager) make routing decisions based on the method name, causing wait
 behavior to vary across methods. For simpler policies (pick_first,
-round_robin), the queue behavior is method-independent, but operators may still
-want per-method queue analysis to correlate with per-call attempt metrics. As an
+round_robin), the delay behavior is method-independent, but operators may still
+want per-method delay analysis to correlate with per-call attempt metrics. As an
 optional label, it defaults to off and only adds cardinality when explicitly
 enabled.
 
 `wrr_locality` and `outlier_detection` are treated as transparent because
-neither makes independent queueing decisions. `wrr_locality` is a configuration
+neither makes independent delaying decisions. `wrr_locality` is a configuration
 wrapper; `outlier_detection` manipulates subchannel state but the actual
-queueing is decided by the child policy's picker. When outlier detection ejects
+delaying is decided by the child policy's picker. When outlier detection ejects
 100% of endpoints, the child policy (e.g., pick_first) enters
-TRANSIENT_FAILURE and returns an error rather than a queue result, so no queue
+TRANSIENT_FAILURE and returns an error rather than a pending result, so no delay
 metric is recorded. In partial ejection scenarios, the child is genuinely in
-CONNECTING state and the token is accurate. Operators can correlate queue
+CONNECTING state and the token is accurate. Operators can correlate delay
 duration with the existing `grpc.lb.outlier_detection.ejections_enforced` metric
 ([A91]) for root cause analysis.
 
-The tracing enhancement reuses the same bounded queue reason token as the metric
+The tracing enhancement reuses the same bounded delay reason token as the metric
 label rather than introducing a separate high-cardinality trace reason string.
 This keeps the API surface minimal — one token serves both metrics and traces —
 and avoids the need for pickers to maintain two separate strings. If richer,
