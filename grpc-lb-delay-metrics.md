@@ -466,8 +466,8 @@ class SubchannelPicker : public DualRefCounted<SubchannelPicker> {
  public:
     virtual PickResult Pick(PickArgs args) = 0;
 
-    // Returns the bounded queue reason token. Default returns empty.
-    virtual absl::string_view GetQueueMetricToken() const { return ""; }
+    // Returns the bounded delay reason token. Default returns empty.
+    virtual absl::string_view GetDelayMetricToken() const { return ""; }
 };
 ```
 
@@ -478,7 +478,7 @@ class PickFirstQueuePicker final : public SubchannelPicker {
     PickResult Pick(PickArgs) override {
         return PickResult::Queue(kToken);
     }
-    absl::string_view GetQueueMetricToken() const override { return kToken; }
+    absl::string_view GetDelayMetricToken() const override { return kToken; }
 
  private:
     static constexpr absl::string_view kToken = "pick_first:connecting";
@@ -493,7 +493,7 @@ class PriorityPicker final : public SubchannelPicker {
                    RefCountedPtr<SubchannelPicker> child)
         : child_(std::move(child)) {
         // Compose token at construction time (stored as member string).
-        auto child_token = child_->GetQueueMetricToken();
+        auto child_token = child_->GetDelayMetricToken();
         if (!child_token.empty()) {
             composite_token_ = absl::StrCat("priority_p",
                                              priority_index, ":",
@@ -509,7 +509,7 @@ class PriorityPicker final : public SubchannelPicker {
         return result;
     }
 
-    absl::string_view GetQueueMetricToken() const override {
+    absl::string_view GetDelayMetricToken() const override {
         return composite_token_;
     }
 
@@ -534,9 +534,9 @@ histogram observation each time the token changes (per-segment emission):
 ```go
 func (pw *pickerWrapper) pick(ctx context.Context, failfast bool,
     info balancer.PickInfo) (pick, error) {
-    var queueStartTime time.Time
-    var queueToken string
-    var queued bool
+    var delayStartTime time.Time
+    var delayToken string
+    var delayed bool
     method := info.FullMethodName
 
     for {
@@ -554,21 +554,21 @@ func (pw *pickerWrapper) pick(ctx context.Context, failfast bool,
                     currentToken = qt.DelayMetricToken()
                 }
 
-                if !queued {
+                if !delayed {
                     // First delay event — start timing, increment counter.
-                    queued = true
-                    queueStartTime = time.Now()
-                    queueToken = currentToken
+                    delayed = true
+                    delayStartTime = time.Now()
+                    delayToken = currentToken
                     rpcWaitingMetric.Record(metricsRecorder, 1, target)
-                } else if currentToken != queueToken {
+                } else if currentToken != delayToken {
                     // Token changed (new picker with different state).
                     // Emit segment for the previous token.
-                    duration := time.Since(queueStartTime).Seconds()
+                    duration := time.Since(delayStartTime).Seconds()
                     pickDelayDurationMetric.Record(metricsRecorder,
-                        duration, target, queueToken, method)
+                        duration, target, delayToken, method)
                     // Start new segment.
-                    queueStartTime = time.Now()
-                    queueToken = currentToken
+                    delayStartTime = time.Now()
+                    delayToken = currentToken
                 }
                 continue
             }
@@ -576,15 +576,15 @@ func (pw *pickerWrapper) pick(ctx context.Context, failfast bool,
         }
 
         // Pick succeeded. If we were delayed, record final segment.
-        if queued {
-            duration := time.Since(queueStartTime).Seconds()
+        if delayed {
+            duration := time.Since(delayStartTime).Seconds()
             pickDelayDurationMetric.Record(metricsRecorder,
-                duration, target, queueToken, method)
+                duration, target, delayToken, method)
             rpcWaitingMetric.Record(metricsRecorder, -1, target)
             if attemptSpan != nil {
                 attemptSpan.AddEvent("Delayed LB pick complete",
                     attribute.Float64("delay_duration", duration),
-                    attribute.String("delay_reason", queueToken))
+                    attribute.String("delay_reason", delayToken))
             }
         }
         // ... existing transport handling ...
@@ -596,15 +596,15 @@ On context cancellation (existing `case <-ctx.Done():` block), the same
 recording logic applies:
 ```go
 case <-ctx.Done():
-    if queued {
-        duration := time.Since(queueStartTime).Seconds()
+    if delayed {
+        duration := time.Since(delayStartTime).Seconds()
         pickDelayDurationMetric.Record(metricsRecorder,
-            duration, target, queueToken, method)
+            duration, target, delayToken, method)
         rpcWaitingMetric.Record(metricsRecorder, -1, target)
         if attemptSpan != nil {
             attemptSpan.AddEvent("Delayed LB pick complete",
                 attribute.Float64("delay_duration", duration),
-                attribute.String("delay_reason", queueToken))
+                attribute.String("delay_reason", delayToken))
         }
     }
     // ... existing error return ...
@@ -654,15 +654,27 @@ if (transport != null) {
 #### C++ (Core) — `load_balanced_call_destination.cc`
 
 In the pick loop, when `PickResult::Queue` is returned, the start time and token
-are captured. When the pick eventually succeeds or the call is cancelled, the
-duration is recorded:
+are captured. If the token changes during the wait, the current segment is recorded
+and a new one begins. When the pick eventually succeeds or the call is cancelled, the
+final duration is recorded:
 
 ```cpp
-// In the pick processing lambda (simplified):
-auto queue_func = [&](LoadBalancingPolicy::PickResult::Queue* queue_pick) {
+// In the pick processing lambda:
+auto delay_func = [&](LoadBalancingPolicy::PickResult::Queue* delay_pick) {
+    std::string current_token = std::string(delay_pick->metric_token);
     if (!delay_start_time.has_value()) {
         delay_start_time = Timestamp::Now();
-        delay_token = std::string(queue_pick->metric_token);
+        delay_token = current_token;
+    } else if (current_token != delay_token) {
+        // Token changed: Emit segment for the previous token
+        Duration delay_duration = Timestamp::Now() - *delay_start_time;
+        stats_plugin_group.RecordHistogram(
+            kPickDelayDurationHandle,
+            delay_duration.seconds(),
+            {target}, {delay_token});
+        // Start new segment
+        delay_start_time = Timestamp::Now();
+        delay_token = current_token;
     }
     return Continue{};
 };
