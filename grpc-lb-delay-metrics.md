@@ -315,7 +315,33 @@ func (p *rlsPicker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
 ```go
 type priorityPicker struct {
     childPicker balancer.Picker
-    delayToken  string // e.g., "priority_p0:" + childToken
+    delayToken  string // pre-composed for static children
+    prefix      string // "priority_p0:"
+}
+
+func newPriorityPicker(child balancer.Picker, priorityName string) balancer.Picker {
+    prefix := priorityName + ":"
+    p := &priorityPicker{childPicker: child, prefix: prefix}
+    if dt, ok := child.(balancer.DelayMetricTokener); ok {
+        childToken := dt.DelayMetricToken()
+        if childToken != "" {
+            p.delayToken = prefix + childToken
+        }
+    }
+    return p
+}
+
+func (p *priorityPicker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
+    res, err := p.childPicker.Pick(info)
+    if err != nil {
+        // If child returned a per-pick token, prepend our prefix
+        if pe, ok := err.(*balancer.PendingPickError); ok {
+            return res, &balancer.PendingPickError{
+                MetricToken: p.prefix + pe.MetricToken,
+            }
+        }
+    }
+    return res, err
 }
 
 func (p *priorityPicker) DelayMetricToken() string {
@@ -376,6 +402,39 @@ private class Picker extends SubchannelPicker {
 
     @Override
     public String getDelayMetricToken() { return delayMetricToken; }
+}
+```
+
+**Example implementation in a delegating load balancer (`PriorityLoadBalancer`):**
+```java
+private class PriorityPicker extends SubchannelPicker {
+    private final SubchannelPicker childPicker;
+    private final String delayMetricToken;
+    private final String prefix;
+
+    PriorityPicker(SubchannelPicker child, String prefix) {
+        this.childPicker = child;
+        this.prefix = prefix;
+        // Pre-compose for static children
+        String childToken = child.getDelayMetricToken();
+        this.delayMetricToken = childToken.isEmpty() ? "" : prefix + childToken;
+    }
+
+    @Override
+    public PickResult pickSubchannel(PickSubchannelArgs args) {
+        PickResult result = childPicker.pickSubchannel(args);
+        // If child returned a per-pick delay token, prepend our prefix
+        String childDynamicToken = result.getDelayMetricToken();
+        if (!childDynamicToken.isEmpty() && !childDynamicToken.equals(childPicker.getDelayMetricToken())) {
+             return PickResult.withNoResult(prefix + childDynamicToken);
+        }
+        return result;
+    }
+
+    @Override
+    public String getDelayMetricToken() {
+        return delayMetricToken;
+    }
 }
 ```
 
