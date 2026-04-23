@@ -9,12 +9,7 @@ Load Balancer Pick Queue Delay Observability
 
 ## Abstract
 
-This proposal introduces observability for the duration that RPCs spend queued
-in the gRPC client channel waiting for a load balancing pick to complete. Today,
-when a picker returns "queue" (e.g., because subchannels are in `CONNECTING`
-state), the client channel silently buffers the RPC until a new picker is
-available. This latency is invisible to operators, making it difficult to
-diagnose which layer of the LB policy tree is causing delay.
+This proposal introduces observability for the duration that RPCs spend waiting in the gRPC client channel waiting for a load balancing pick to complete. Today, when a picker indicates that no subchannel is available, the client channel then defers the RPC (either by queueing it or blocking the caller) until the LB policy provides a new picker or the RPC context is canceled/times out. This latency is invisible to operators, making it difficult to diagnose which layer of the LB policy tree is causing the delay.
 
 This gRFC defines:
 1. A new histogram metric (`grpc.lb.pick_queue_duration`) recorded by the client
@@ -33,10 +28,8 @@ This gRFC defines:
 ## Background
 
 gRPC uses a tree of load balancing policies to select a subchannel for each RPC.
-When no suitable subchannel is available, the picker returns a "queue" result and
-the client channel buffers the RPC until the LB policy provides a new picker.
-This buffering can add significant latency, but operators currently have no
-visibility into:
+When no suitable subchannel is available, the picker indicates this state to the client channel. The client channel then defers the RPC (either by queueing it or blocking the caller) until the LB policy provides a new picker or the RPC's context is canceled or times out.
+Operators currently have no visibility into:
 - **How long** RPCs are queued.
 - **Why** they are queued (which policy in the tree caused it).
 
@@ -624,6 +617,20 @@ if (queue_start_time.has_value()) {
 }
 ```
 
+#### C-Core Specifics: RLS Cache Misses and HTTP/2 Max Concurrent Streams
+
+In `grpc-core`, the boundary between Load Balancing and the Transport layer introduces two highly specific queuing scenarios that must be handled distinctly in the `PickResult::Queue` tokenization.
+
+**1. RLS Cache Misses (Dynamic Token Lifetime)**
+Unlike static policies (like `pick_first`), the RLS policy in C-Core evaluates targets dynamically per-call. When a cache miss occurs, the RLS policy initiates a control-plane request and returns `PickResult::Queue`.
+*   **The C-Core Constraint:** The `PickResult::Queue` struct uses an `absl::string_view` to prevent allocations on the hot path. However, because an RLS cache miss is dynamic, the string it points to must safely outlive the pick.
+*   **Implementation:** The RLS LB Policy must maintain a static, pre-allocated pool of `std::string` constants for its state transitions (e.g., `static const std::string kRlsPending = "rls:lookup_pending";`). During a cache miss `Pick()`, the policy returns a `string_view` pointing explicitly to this constant memory address, ensuring safe reference lifecycle without dynamic memory allocation per RPC.
+
+**2. MAX_CONCURRENT_STREAMS (Transport-Level Queueing)**
+In C-Core, queueing can occur even when the LB Policy successfully finds a `READY` subchannel. If the HTTP/2 transport for that subchannel has reached its `SETTINGS_MAX_CONCURRENT_STREAMS` limit, the `grpc_call` must be queued.
+*   **The Distinction:** This is a *transport* queue, not an *LB routing* queue.
+*   **Implementation:** The LB policy's `Pick()` method will actually succeed and return a `READY` subchannel. However, the `client_channel` filter will detect the transport exhaustion. To maintain observability, the `client_channel` filter itself will inject a synthetic token: `"transport:max_concurrent_streams"`. The queue timer will start, and the RPC will wait in the filter's pending list until a stream becomes available or the context deadline is exceeded. This clearly separates network capacity limits from LB routing failures in the resulting telemetry.
+
 ### Metric Instrument Registration
 
 #### Go
@@ -636,8 +643,8 @@ var pickQueueDurationMetric = estats.RegisterFloat64Histo(
         Name:           "grpc.lb.pick_queue_duration",
         Description:    "EXPERIMENTAL. Time an RPC spent queued waiting " +
                         "for a load balancing pick.",
-        Unit:           "s",
-        Labels:         []string{"grpc.target", "grpc.lb.queue_reason"},
+        Unit:            "s",
+        Labels:          []string{"grpc.target", "grpc.lb.queue_reason"},
         OptionalLabels: []string{"grpc.method"},
         Default:        false,
     })
