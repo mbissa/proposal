@@ -4,7 +4,7 @@ Load Balancer Pick Queue Delay Observability
 * Approver: TBD
 * Status: Draft
 * Implemented in: Go, Java, C++
-* Last updated: 2026-04-21
+* Last updated: 2026-04-22
 * Discussion at: TBD
 
 ## Abstract
@@ -18,12 +18,17 @@ diagnose which layer of the LB policy tree is causing delay.
 
 This gRFC defines:
 1. A new histogram metric (`grpc.lb.pick_queue_duration`) recorded by the client
-   channel, with a bounded `grpc.lb.queue_reason` label whose value is supplied
-   by the LB policy's picker.
-2. An enhancement to the existing "Delayed LB pick complete" span event ([A72])
+   channel, with bounded `grpc.lb.queue_reason` and optional `grpc.method`
+   labels. The histogram emits one observation per queue reason segment,
+   providing per-layer delay breakdown when an RPC transitions through multiple
+   LB policy states.
+2. A new up-down counter metric (`grpc.lb.pick_queue_active`) tracking the
+   number of RPCs currently queued, providing visibility into stuck traffic.
+3. An enhancement to the existing "Delayed LB pick complete" span event ([A72])
    to include the queue reason and queue duration as span event attributes.
-3. API changes in each language to allow pickers to expose the queue reason as a
-   bounded, pre-computed string token.
+4. API changes in each language to allow pickers to expose the queue reason as a
+   bounded, pre-computed string token, with support for both picker-level tokens
+   (uniform policies) and per-pick tokens (RLS, cluster_manager).
 
 ## Background
 
@@ -57,24 +62,34 @@ does not isolate it, and provides no information about the queueing cause.
 ## Proposal
 
 Using [A79]'s non-per-call metrics architecture and [A72]'s tracing framework,
-we will add a histogram metric and enhanced trace span event that measure the
-time each RPC spends queued waiting for a load balancing pick.
+we will add a histogram metric, an active queue gauge, and enhanced trace span
+event that measure the time each RPC spends queued waiting for a load balancing
+pick.
 
-Each LB policy's picker will pre-compute a bounded string **queue reason token**
-at construction time describing why it would queue RPCs (e.g.,
-`"pick_first:connecting"`). Delegating policies compose tokens by prepending
-their own prefix to their child picker's token (e.g.,
-`"priority_p0:pick_first:connecting"`). The client channel's pick-queueing loop
-reads this token from the picker when a pick is queued, records the queue start
-time, and when the queue wait ends (either by a successful pick or context
-cancellation), records both a histogram observation and a span event with
-attributes.
+Each LB policy's picker provides a bounded string **queue reason token**
+describing why it would queue RPCs (e.g., `"pick_first:connecting"`). For
+policies with uniform picker state (pick_first, round_robin, ring_hash,
+priority), the token is pre-computed at picker construction time. For policies
+that make per-request routing decisions (RLS, cluster_manager), the token is
+determined inside `Pick()` and varies per-RPC. Delegating policies compose
+tokens by prepending their own prefix to their child picker's token (e.g.,
+`"priority_p0:pick_first:connecting"`).
 
-Tokens are pre-computed strings stored on the picker, so the pick path reads
-them by reference with zero dynamic allocations. The token API uses optional
-interfaces (Go) or default-returning methods (Java, C++) so that existing custom
-LB policies continue to work without modification — they simply report an empty
-token, and the metric is still recorded under the `grpc.target` label alone.
+The client channel's pick-queueing loop reads this token from the picker when a
+pick is queued, records the queue start time, and emits one histogram
+observation per queue reason segment — if the token changes during the wait
+(e.g., an RLS lookup completes, causing a transition from `rls:lookup_pending`
+to `rls:pick_first:connecting`), the current segment is closed and a new one
+begins. An up-down counter tracks how many RPCs are currently queued,
+providing visibility into stuck traffic that has not yet emitted a histogram
+observation.
+
+For policies with uniform picker state, tokens are pre-computed strings stored
+on the picker, so the pick path reads them by reference with zero dynamic
+allocations. The token API uses optional interfaces (Go) or default-returning
+methods (Java, C++) so that existing custom LB policies continue to work without
+modification — they simply report an empty token, and the metric is still
+recorded under the `grpc.target` label alone.
 
 ### Metric Definition
 
@@ -87,16 +102,45 @@ defined in [A79][A79].
 | **Type** | Float64 Histogram |
 | **Unit** | `s` (seconds) |
 | **Description** | EXPERIMENTAL. Time an RPC spent queued waiting for a load balancing pick, broken down by the reason for queueing. |
-| **Labels** | `grpc.target` |
-| **Optional Labels** | `grpc.lb.queue_reason` |
+| **Labels** | `grpc.target`, `grpc.lb.queue_reason` |
+| **Optional Labels** | `grpc.method` |
 | **Bucket Boundaries** | Same as A66 latency buckets: 0, 0.00001, 0.00005, 0.0001, 0.0003, 0.0006, 0.0008, 0.001, 0.002, 0.003, 0.004, 0.005, 0.006, 0.008, 0.01, 0.013, 0.016, 0.02, 0.025, 0.03, 0.04, 0.05, 0.065, 0.08, 0.1, 0.13, 0.16, 0.2, 0.25, 0.3, 0.4, 0.5, 0.65, 0.8, 1, 2, 5, 10, 20, 50, 100 |
 | **Default Enabled** | `false` (experimental, opt-in) |
 
-The metric is recorded once per RPC that experienced queueing, when the queue
-wait ends. The duration is the wall-clock time from when the pick was first
-queued to when a successful pick was obtained (or the RPC was cancelled). If the
-queue reason token changes during the wait (e.g., due to priority failover), the
-final token observed at the time of dequeue is used as the label value.
+> **Note on histogram aggregation**: The gRPC non-per-call metrics framework
+> ([A79]) currently supports only explicit bucket histograms. Explicit buckets
+> lose fidelity for values between wide boundaries (e.g., values in the
+> `[20, 50)` range are indistinguishable). When the framework adds support for
+> exponential bucket histograms, this metric should be migrated to use
+> exponential aggregation for better tail-latency fidelity. In the interim,
+> operators can override the aggregation strategy to exponential using
+> OpenTelemetry SDK Views at the application level.
+
+If the queue reason token changes during the wait (e.g., due to an RLS lookup
+completing or a priority failover), the recording loop emits one histogram
+observation **per queue reason segment**. A segment ends when a new picker
+arrives with a different token, or when the queue wait ends. A single RPC may
+therefore contribute multiple histogram observations, each covering the time
+spent under a specific queue reason. This per-segment approach gives operators
+visibility into how much time each layer of the LB policy tree contributed to
+the total queue delay.
+
+The following gauge metric is also registered to provide visibility into RPCs
+that are currently queued and have not yet emitted a histogram observation:
+
+| Field | Value |
+|---|---|
+| **Name** | `grpc.lb.pick_queue_active` |
+| **Type** | Int64 UpDownCounter |
+| **Unit** | `{call}` |
+| **Description** | EXPERIMENTAL. Number of RPCs currently queued waiting for a load balancing pick. |
+| **Labels** | `grpc.target` |
+| **Default Enabled** | `false` (experimental, opt-in) |
+
+The counter is incremented (`+1`) when a pick is first queued and decremented
+(`-1`) when the queue wait ends (successful pick or cancellation). This matches
+the pattern used by `grpc.subchannel.open_connections` ([A94]) and
+`grpc.tcp.connection_count` ([A80]).
 
 #### Label Definitions
 
@@ -104,6 +148,7 @@ final token observed at the time of dequeue is used as the label value.
 |---|---|---|
 | `grpc.target` | String | The target URI of the channel. Required. |
 | `grpc.lb.queue_reason` | String | The bounded queue reason token from the picker. Optional label. |
+| `grpc.method` | String | The full method name of the RPC (e.g., `/pkg.Service/Method`). Optional label. Available from `PickInfo` at queue time. Primarily useful for policies like RLS where queue behavior varies by method. |
 
 ### Queue Reason Token Semantics
 
@@ -139,7 +184,7 @@ Delegating policies prepend a prefix to their child picker's token.
 | Policy | Prefix | Notes |
 |---|---|---|
 | `priority` | `priority_p{N}:` | N is the 0-based priority index. Typical deployments use ≤5 priorities, bounding cardinality. |
-| `cluster_manager` | `cluster_manager:` | Cluster names are intentionally omitted for cardinality safety. |
+| `cluster_manager` | *(per-pick)* | Routes RPCs to different child pickers per-request. The token is the child picker's token, resolved at pick time. See Per-Pick Tokens. |
 | `rls` | `rls:` | When routing to a resolved child policy (post-lookup). |
 | `cds` | `cds:` | When delegating to a child policy (post-discovery). |
 | `wrr_locality` | *(transparent)* | Passes child tokens through unmodified. |
@@ -147,28 +192,49 @@ Delegating policies prepend a prefix to their child picker's token.
 
 #### Token Composition
 
-Token composition occurs at **picker construction time**, not on the pick path.
-When a delegating policy creates its picker, it reads the child picker's token
-and stores the composite string as a member of its own picker. This ensures
-zero allocations during `Pick()`.
+For most policies, token composition occurs at **picker construction time**, not
+on the pick path. When a delegating policy creates its picker, it reads the
+child picker's token and stores the composite string as a member of its own
+picker. This ensures zero allocations during `Pick()`.
 
-**Example flow** for `cluster_manager → priority → pick_first`:
+**Example flow** for `priority → pick_first`:
 1. `pick_first` creates a picker with token `"pick_first:connecting"`.
 2. `priority` wraps the child, creating its picker with token
    `"priority_p0:pick_first:connecting"` (stored as a member string).
-3. `cluster_manager` wraps priority, creating its picker with token
-   `"cluster_manager:priority_p0:pick_first:connecting"`.
 
 When a delegating policy has a **READY** child (no queueing), the token is the
 empty string `""`, and the pick completes without queueing.
+
+#### Per-Pick Tokens
+
+Some policies make per-request routing decisions within `Pick()`, causing the
+queue reason to vary across RPCs handled by the same picker. These policies
+provide their token via the queue result rather than a picker-level method:
+
+- **RLS**: A single `rlsPicker` performs a per-request cache lookup. A cache
+  miss queues with `rls:lookup_pending`, while a cache hit that delegates to a
+  child in CONNECTING state queues with `rls:pick_first:connecting`. The token
+  must be determined inside `Pick()` and attached to the queue result.
+
+- **cluster_manager**: Routes RPCs to different child pickers based on the
+  cluster selected by xDS routing. Different RPCs may reach different child
+  pickers in different states. The token is read from whichever child picker
+  handled the specific RPC.
+
+The mechanism for attaching per-pick tokens is described in the language-specific
+API sections below.
 
 ### Language-Specific API Changes
 
 #### Go
 
 Go's `Picker` interface has a single `Pick()` method. Adding a method would
-break all existing implementations. Instead, we define an **optional interface**
-that pickers may implement:
+break all existing implementations. Two mechanisms are provided for supplying
+queue reason tokens:
+
+**Picker-level token** — for policies with uniform picker state (pick_first,
+round_robin, ring_hash, priority). An optional interface that pickers may
+implement:
 
 ```go
 // In package balancer
@@ -183,20 +249,43 @@ type QueueMetricTokener interface {
 }
 ```
 
-Built-in pickers (`QueuePicker`, `errPicker`, etc.) and LB policy pickers
-(`pick_first`, `round_robin`, `ring_hash`, `priority`, etc.) will implement this
-interface. Custom LB policies that do not implement it will simply report an
-empty token, and the metric will still record the queue duration under the
-`grpc.target` label alone.
+**Per-pick token** — for policies where the queue reason varies per-RPC (RLS,
+cluster_manager). A structured error type that wraps `ErrNoSubConnAvailable`
+with a token:
 
-**Example implementation in `pick_first`:**
+```go
+// In package balancer
+
+// QueueError is returned by Pick() to signal queueing with a per-pick
+// metric token. It is equivalent to ErrNoSubConnAvailable but carries
+// a queue reason token that may vary per-RPC.
+type QueueError struct {
+    // MetricToken is the bounded queue reason token for this specific pick.
+    MetricToken string
+}
+
+func (e *QueueError) Error() string { return "no SubConn available" }
+func (e *QueueError) Is(target error) bool {
+    return target == ErrNoSubConnAvailable
+}
+```
+
+The recording loop resolves the token with the following precedence: if the
+error is a `*QueueError`, use its `MetricToken`; otherwise, check whether the
+picker implements `QueueMetricTokener`; otherwise, use the empty string.
+
+Built-in pickers (`pick_first`, `round_robin`, `ring_hash`, `priority`, etc.)
+implement `QueueMetricTokener`. Custom LB policies that implement neither
+mechanism report an empty token.
+
+**Example — `pick_first` (picker-level):**
 ```go
 type pfPicker struct {
-    subConn  balancer.SubConn
+    subConn    balancer.SubConn
     queueToken string // set at construction: "pick_first:connecting" or ""
 }
 
-func (p *pfPicker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
+func (p *pfPicker) Pick(balancer.PickInfo) (balancer.PickResult, error) {
     return balancer.PickResult{SubConn: p.subConn}, nil
 }
 
@@ -205,7 +294,31 @@ func (p *pfPicker) QueueMetricToken() string {
 }
 ```
 
-**Example delegating implementation in `priority`:**
+**Example — `rls` (per-pick):**
+```go
+func (p *rlsPicker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
+    // ... cache lookup using info.FullMethodName and request keys ...
+    switch {
+    case dcEntry == nil && pendingEntry == nil:
+        p.sendRouteLookupRequest(cacheKey, ...)
+        return balancer.PickResult{},
+            &balancer.QueueError{MetricToken: "rls:lookup_pending"}
+    case dcEntry == nil && pendingEntry != nil:
+        return balancer.PickResult{},
+            &balancer.QueueError{MetricToken: "rls:lookup_pending"}
+    case dcEntry != nil:
+        // Delegate to child policy — child's Pick() may return its
+        // own QueueError or ErrNoSubConnAvailable.
+        pr, err := childPicker.Pick(info)
+        if qe, ok := err.(*balancer.QueueError); ok {
+            qe.MetricToken = "rls:" + qe.MetricToken
+        }
+        return pr, err
+    }
+}
+```
+
+**Example — `priority` (picker-level, delegating):**
 ```go
 type priorityPicker struct {
     childPicker balancer.Picker
@@ -219,8 +332,10 @@ func (p *priorityPicker) QueueMetricToken() string {
 
 #### Java
 
-Java's `PickResult` is `final` and `@Immutable`. We add a new static factory
-method and a getter, which is backwards-compatible:
+Java's `PickResult` is `final` and `@Immutable`. The per-pick token is carried
+on the `PickResult` itself via a new factory method, which naturally supports
+policies like RLS where the queue reason varies per-RPC. The `SubchannelPicker`
+also gets a default method for delegating policies that have uniform state:
 
 ```java
 // In LoadBalancer.PickResult
@@ -273,9 +388,10 @@ private class Picker extends SubchannelPicker {
 
 #### C++ (Core)
 
-The `PickResult::Queue` struct is extended to hold a `string_view` pointing to
-a picker-owned string. This involves zero dynamic allocations on the pick path
-since `string_view` is a non-owning reference:
+The `PickResult::Queue` struct is extended to hold a `string_view` carrying the
+per-pick token. Since `Queue` is returned from `Pick()`, this naturally supports
+policies where the token varies per-RPC. The `string_view` points to a
+picker-owned string, involving zero dynamic allocations on the pick path:
 
 ```cpp
 // In LoadBalancingPolicy::PickResult
@@ -359,37 +475,60 @@ time and records the metric.
 
 #### Go — `picker_wrapper.go`
 
-In the `pick()` method's blocking loop:
+In the `pick()` method's blocking loop, the recording logic resolves the token
+from either a `QueueError` or the `QueueMetricTokener` interface, and emits a
+histogram observation each time the token changes (per-segment emission):
 
 ```go
 func (pw *pickerWrapper) pick(ctx context.Context, failfast bool,
     info balancer.PickInfo) (pick, error) {
     var queueStartTime time.Time
     var queueToken string
+    var queued bool
+    method := info.FullMethodName
 
     for {
         // ... existing picker load and blocking logic ...
 
         pickResult, err := p.Pick(info)
         if err != nil {
-            if err == balancer.ErrNoSubConnAvailable {
-                // Record queue start on first queue event.
-                if queueStartTime.IsZero() {
+            if errors.Is(err, balancer.ErrNoSubConnAvailable) {
+                // Resolve per-pick token from QueueError, or fall
+                // back to picker-level QueueMetricTokener.
+                currentToken := ""
+                if qe, ok := err.(*balancer.QueueError); ok {
+                    currentToken = qe.MetricToken
+                } else if qt, ok := p.(balancer.QueueMetricTokener); ok {
+                    currentToken = qt.QueueMetricToken()
+                }
+
+                if !queued {
+                    // First queue event — start timing, increment counter.
+                    queued = true
                     queueStartTime = time.Now()
-                    if qt, ok := p.(balancer.QueueMetricTokener); ok {
-                        queueToken = qt.QueueMetricToken()
-                    }
+                    queueToken = currentToken
+                    pickQueueActiveMetric.Record(metricsRecorder, 1, target)
+                } else if currentToken != queueToken {
+                    // Token changed (new picker with different state).
+                    // Emit segment for the previous token.
+                    duration := time.Since(queueStartTime).Seconds()
+                    pickQueueDurationMetric.Record(metricsRecorder,
+                        duration, target, queueToken, method)
+                    // Start new segment.
+                    queueStartTime = time.Now()
+                    queueToken = currentToken
                 }
                 continue
             }
             // ... existing error handling ...
         }
 
-        // Pick succeeded. If we were queued, record the duration and span event.
-        if !queueStartTime.IsZero() {
+        // Pick succeeded. If we were queued, record final segment.
+        if queued {
             duration := time.Since(queueStartTime).Seconds()
-            pickQueueDurationMetric.Record(metricsRecorder, duration,
-                target, queueToken)
+            pickQueueDurationMetric.Record(metricsRecorder,
+                duration, target, queueToken, method)
+            pickQueueActiveMetric.Record(metricsRecorder, -1, target)
             if attemptSpan != nil {
                 attemptSpan.AddEvent("Delayed LB pick complete",
                     attribute.Float64("queue_duration", duration),
@@ -405,10 +544,11 @@ On context cancellation (existing `case <-ctx.Done():` block), the same
 recording logic applies:
 ```go
 case <-ctx.Done():
-    if !queueStartTime.IsZero() {
+    if queued {
         duration := time.Since(queueStartTime).Seconds()
-        pickQueueDurationMetric.Record(metricsRecorder, duration,
-            target, queueToken)
+        pickQueueDurationMetric.Record(metricsRecorder,
+            duration, target, queueToken, method)
+        pickQueueActiveMetric.Record(metricsRecorder, -1, target)
         if attemptSpan != nil {
             attemptSpan.AddEvent("Delayed LB pick complete",
                 attribute.Float64("queue_duration", duration),
@@ -497,8 +637,18 @@ var pickQueueDurationMetric = estats.RegisterFloat64Histo(
         Description:    "EXPERIMENTAL. Time an RPC spent queued waiting " +
                         "for a load balancing pick.",
         Unit:           "s",
+        Labels:         []string{"grpc.target", "grpc.lb.queue_reason"},
+        OptionalLabels: []string{"grpc.method"},
+        Default:        false,
+    })
+
+var pickQueueActiveMetric = estats.RegisterInt64UpDownCount(
+    estats.MetricDescriptor{
+        Name:           "grpc.lb.pick_queue_active",
+        Description:    "EXPERIMENTAL. Number of RPCs currently queued " +
+                        "waiting for a load balancing pick.",
+        Unit:           "{call}",
         Labels:         []string{"grpc.target"},
-        OptionalLabels: []string{"grpc.lb.queue_reason"},
         Default:        false,
     })
 ```
@@ -512,9 +662,19 @@ private static final LongHistogramInstrumentDescriptor PICK_QUEUE_DURATION =
         "EXPERIMENTAL. Time an RPC spent queued waiting "
             + "for a load balancing pick.",
         "s",
-        List.of("grpc.target"),                // required labels
-        List.of("grpc.lb.queue_reason"),       // optional labels
-        false);                                // default disabled
+        List.of("grpc.target", "grpc.lb.queue_reason"),  // required labels
+        List.of("grpc.method"),                           // optional labels
+        false);                                          // default disabled
+
+private static final LongUpDownCounterMetricInstrument PICK_QUEUE_ACTIVE =
+    InstrumentRegistry.registerLongUpDownCounter(
+        "grpc.lb.pick_queue_active",
+        "EXPERIMENTAL. Number of RPCs currently queued "
+            + "waiting for a load balancing pick.",
+        "{call}",
+        List.of("grpc.target"),
+        List.of(),
+        false);
 ```
 
 #### C++ (Core)
@@ -526,8 +686,18 @@ const auto kPickQueueDurationHandle =
         "EXPERIMENTAL. Time an RPC spent queued waiting "
         "for a load balancing pick.",
         "s",
+        /*label_keys=*/{"grpc.target", "grpc.lb.queue_reason"},
+        /*optional_label_keys=*/{"grpc.method"},
+        /*enable_by_default=*/false);
+
+const auto kPickQueueActiveHandle =
+    GlobalInstrumentsRegistry::RegisterUpDownInt64Counter(
+        "grpc.lb.pick_queue_active",
+        "EXPERIMENTAL. Number of RPCs currently queued "
+        "waiting for a load balancing pick.",
+        "{call}",
         /*label_keys=*/{"grpc.target"},
-        /*optional_label_keys=*/{"grpc.lb.queue_reason"},
+        /*optional_label_keys=*/{},
         /*enable_by_default=*/false);
 ```
 
@@ -578,14 +748,58 @@ channel physically buffers RPCs and can accurately measure per-RPC queue
 duration. This mirrors the existing design where per-call metrics ([A66]) are
 recorded by the channel, not by LB policies.
 
-The queue reason token is exposed via the Picker rather than via `PickResult` or
-the error return, because the existing queueing mechanisms differ across
-languages. In Go, queueing is signaled by returning
-`balancer.ErrNoSubConnAvailable` and the `PickResult` is discarded. In C++,
-`PickResult::Queue` is an empty struct. In Java, `PickResult.withNoResult()`
-returns a singleton. An optional interface or default-returning method on the
-Picker aligns with each language's existing mechanism without requiring changes
-to the error type.
+Two mechanisms are provided for supplying queue reason tokens — a picker-level
+optional interface (`QueueMetricTokener`) and a per-pick error/result type
+(`QueueError` / `PickResult.withNoResult(token)` / `Queue::metric_token`). Most
+LB policies have uniform picker state: all RPCs see the same queue reason from a
+given picker instance (pick_first, round_robin, ring_hash, priority). These
+policies use the picker-level mechanism, which involves zero allocations on the
+pick path. However, RLS and cluster_manager make per-request routing decisions
+within `Pick()` — RLS does a per-request cache lookup, and cluster_manager
+routes RPCs to different child pickers based on the xDS-selected cluster. For
+these policies, the queue reason varies per-RPC, requiring the token to be
+determined inside `Pick()` and attached to the queue result.
+
+The recording loop emits one histogram observation per queue reason segment
+rather than a single observation per RPC. An RPC that transitions through
+multiple queue reasons (e.g., `rls:lookup_pending` for 10 seconds, then
+`rls:pick_first:connecting` for 0.1 seconds after the lookup completes) produces
+two histogram observations, one for each segment. This per-segment approach
+provides visibility into how much time each layer of the LB policy tree
+contributed to the total queue delay. Without it, a single 10.1-second
+observation attributed to `rls:lookup_pending` would obscure the fact that the
+RLS lookup accounted for the vast majority of the delay.
+
+The `grpc.lb.pick_queue_active` up-down counter is provided because the
+histogram metric is emitted only when a queue wait ends. RPCs that are
+indefinitely stuck in the queue (e.g., target unreachable, infinite backoff)
+never emit a histogram observation. The counter gives operators a real-time
+count of currently-queued RPCs, enabling alerting on stuck traffic. Every LB
+policy in the tree can cause indefinite queueing (pick_first cycling through
+CONNECTING/TF, RLS server unreachable, CDS resource never arriving), making this
+counter essential. An up-down counter is used rather than a callback gauge
+because the recording loop has the exact synchronous entry/exit points, matching
+the pattern used by `grpc.subchannel.open_connections` ([A94]) and
+`grpc.tcp.connection_count` ([A80]).
+
+`grpc.method` is included as an optional label because some policies (RLS,
+cluster_manager) make routing decisions based on the method name, causing queue
+behavior to vary across methods. For simpler policies (pick_first,
+round_robin), the queue behavior is method-independent, but operators may still
+want per-method queue analysis to correlate with per-call attempt metrics. As an
+optional label, it defaults to off and only adds cardinality when explicitly
+enabled.
+
+`wrr_locality` and `outlier_detection` are treated as transparent because
+neither makes independent queueing decisions. `wrr_locality` is a configuration
+wrapper; `outlier_detection` manipulates subchannel state but the actual
+queueing is decided by the child policy's picker. When outlier detection ejects
+100% of endpoints, the child policy (e.g., pick_first) enters
+TRANSIENT_FAILURE and returns an error rather than a queue result, so no queue
+metric is recorded. In partial ejection scenarios, the child is genuinely in
+CONNECTING state and the token is accurate. Operators can correlate queue
+duration with the existing `grpc.lb.outlier_detection.ejections_enforced` metric
+([A91]) for root cause analysis.
 
 The tracing enhancement reuses the same bounded queue reason token as the metric
 label rather than introducing a separate high-cardinality trace reason string.
@@ -595,18 +809,6 @@ dynamic trace context (e.g., IP addresses, RLS keys) is needed in the future,
 it can be added as additional span event attributes without changing the token
 API.
 
-`wrr_locality` and `outlier_detection` are treated as transparent because
-neither makes independent queueing decisions. `wrr_locality` is a configuration
-wrapper; `outlier_detection` manipulates subchannel state but the actual
-queueing is decided by the child policy's picker. Adding prefixes for these
-would increase token length without diagnostic value.
-
-`grpc.method` is excluded as a label because LB queue duration is a property of
-the channel's LB policy state, which is typically the same for all methods.
-Including it would significantly increase cardinality without commensurate
-diagnostic value. Per-method queue analysis can be correlated with existing
-per-call attempt metrics.
-
 ## Implementation
 
 Implementation will proceed in Go, Java, and C++ (Core), in that order.
@@ -615,6 +817,7 @@ Implementation will proceed in Go, Java, and C++ (Core), in that order.
 [A72]: A72-open-telemetry-tracing.md
 [A78]: A78-grpc-metrics-wrr-pf-xds.md
 [A79]: A79-non-per-call-metrics-architecture.md
+[A80]: A80-tcp-metrics.md
 [A91]: A91-outlier-detection-metrics.md
 [A94]: A94-subchannel-otel-metrics.md
 [A56]: A56-priority-lb-policy.md
