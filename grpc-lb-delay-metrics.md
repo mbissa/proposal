@@ -623,8 +623,13 @@ private PendingStream createPendingStream(PickSubchannelArgs args,
     ClientStreamTracer[] tracers, PickResult pickResult) {
     PendingStream pendingStream = new PendingStream(args, tracers);
     pendingStream.delayStartNanos = System.nanoTime();
-    pendingStream.delayToken = (pickerState.lastPicker != null)
-        ? pickerState.lastPicker.getDelayMetricToken() : "";
+    
+    // Resolve token: prefer PickResult token (dynamic), fallback to Picker token (static)
+    String token = pickResult != null ? pickResult.getDelayMetricToken() : "";
+    if (token.isEmpty() && pickerState.lastPicker != null) {
+        token = pickerState.lastPicker.getDelayMetricToken();
+    }
+    pendingStream.delayToken = token;
     // ... existing logic ...
 }
 ```
