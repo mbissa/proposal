@@ -215,9 +215,9 @@ When a picker defers a pick (it cannot return a ready connection yet), it surfac
 
 The channel reads these only on the deferred path; a successful pick ignores them. Leaf pickers populate the base values and container pickers compose them as the result bubbles up the picker tree (§2). Pickers remain ignorant of `wait_for_ready` semantics and transport races — the channel itself synthesizes `picker_failing_with_wait_for_ready` and `subchannel_state_mismatch` (§2, Rationale).
 
-Concretely, each runtime extends the type it already uses to express a deferred pick:
-*   **Go**: two optional fields on `balancer.PickResult`. Because a deferred pick is signalled today through the `ErrNoSubConnAvailable` sentinel rather than a populated `PickResult`, the deferred path is extended to also surface a populated result carrying the delay metadata to the pick wrapper.
-*   **Java**: carried on `PickResult` (which already transports an LB-supplied `ClientStreamTracer.Factory`), read where the channel interprets a no-result pick.
+Concretely, each runtime carries the two values on the deferred case of the pick-result type it already returns:
+*   **Go**: two new optional fields on `balancer.PickResult`. A deferred pick is signalled by returning the `ErrNoSubConnAvailable` sentinel error (the `PickResult` is otherwise empty today); the picker additionally populates the two fields on that returned `PickResult`, and `pickerWrapper.pick` reads them on the `ErrNoSubConnAvailable` branch before it loops to await the next picker. The end of the wait reuses the existing `pick.blocked` → `stats.DelayedPickComplete` signal.
+*   **Java**: two new fields on `PickResult`, set via a new no-result factory — the buffered-pick case is `PickResult.withNoResult()` (`subchannel == null`, `status == OK`) — read where the channel interprets a buffered pick. `PickResult` already transports an LB-supplied `ClientStreamTracer.Factory`, so this extends an established per-pick carrier.
 *   **C++ (Core)**: `SubchannelPicker::Pick(PickArgs)` already returns a `PickResult` variant whose `Queue` case denotes a deferred pick (the channel queues the call and re-picks on the next picker update). The two values are added to the `PickResult::Queue` struct — today an empty struct — exactly mirroring the Go and Java additions; container pickers (e.g. `priority`) compose them as the `PickResult` is returned up the picker tree.
 
 ##### 2. Tracer-Side API
