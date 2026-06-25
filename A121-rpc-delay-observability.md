@@ -8,14 +8,14 @@
 
 ## Abstract
 
-This proposal introduces client-side metrics and tracing to measure the delays an RPC experiences within the client channel before it is sent over the network. In this context, "delay" refers to the time an RPC spends blocked or queued inside the channel waiting for name resolution, configuration parsing, or downstream connection establishment. To expose these states, this document proposes two new histograms, two dedicated tracing spans, and corresponding additions to the CallTracer and CallAttemptTracer APIs.
+This proposal introduces client-side metrics and tracing to measure the delays an RPC experiences within the client channel before it is sent over the network. In this context, "delay" refers to the time an RPC spends blocked or queued inside the channel waiting for name resolution, configuration parsing, or downstream connection establishment. To expose these states, this document proposes two new histograms, two tracing spans, and corresponding additions to the CallTracer and CallAttemptTracer APIs.
 
 
 ## Background
 
 Existing gRPC core telemetry infrastructure, as defined in [gRPC A66 (OpenTelemetry Metrics)][A66] and [gRPC A72 (OpenTelemetry Tracing)][A72], tracks the overall end-to-end duration of RPC calls and attempts. However, these metrics and spans function as aggregate buckets that do not decompose latency, leaving delays inside the client channel invisible to operators.
 
-Before an RPC attempt can be sent over the network, the client channel must perform several critical operations, including resolving the target name, parsing service configurations, instantiating load balancing policies, and obtaining a connectivity picker. If any of these phases stall—such as during a slow DNS lookup, a Route Lookup Service (RLS) control-plane query, or a Cluster Discovery Service (CDS) metadata fetch—the RPC is delayed. To the application, this appears as high latency or a timeout. However, because current telemetry lacks visibility into these resolution and routing states, developers cannot distinguish between a slow network, a slow backend, or a channel initialization delay. This is particularly challenging for clients utilizing the Route Lookup Service (RLS), where diagnosing RLS-related hangs or isolating whether delays stem from pending route lookups requires complex manual debugging.
+Before an RPC attempt can be sent over the network, the client channel must perform several operations, including resolving the target name, parsing service configurations, instantiating load balancing policies, and obtaining a connectivity picker. If any of these phases stall—such as during a slow DNS lookup, a Route Lookup Service (RLS) control-plane query, or a Cluster Discovery Service (CDS) metadata fetch—the RPC is delayed. To the application, this appears as high latency or a timeout. However, because current telemetry lacks visibility into these resolution and routing states, developers cannot distinguish between a slow network, a slow backend, or a channel initialization delay. This is particularly challenging for clients using the Route Lookup Service (RLS), where diagnosing RLS-related hangs or isolating whether delays stem from pending route lookups requires manual debugging.
 
 While there are many potential sources of delay along the client-side pipeline (including interceptor execution, credential fetching, and filter evaluation), this proposal focuses specifically on introducing observability for the two most common bottlenecks: **name resolution** and **load balancing pick** delays. This proposal establishes a generic telemetry framework extensible to other client-side delays in the future.
 
@@ -31,7 +31,7 @@ While there are many potential sources of delay along the client-side pipeline (
 
 ### 1. Telemetry Schema
 
-To measure client-side delays, we introduce a duration histogram and a dedicated tracing span at the **Call Level** (for name resolution delays), and another histogram and span at the **Attempt Level** (for load balancing pick delays).
+To measure client-side delays, we introduce a duration histogram and a tracing span at the **Call Level** (for name resolution delays), and another histogram and span at the **Attempt Level** (for load balancing pick delays).
 
 We split observability data between low-cardinality metrics and high-cardinality debug tracing across two layers:
 
@@ -107,7 +107,7 @@ To ensure consistency across implementations, we define the taxonomy of metric a
 All connection-related delays are consolidated into a single low-cardinality metric label value (`"connecting"`), while their detailed reasons are recorded inside the `"Delay state transition"` span event (as the `grpc.delay_reason` event attribute).
 
 #### 1. Metric Delay Types (`grpc.delay_type`)
-The `grpc.delay_type` label is a low-cardinality, restricted set of values. To ensure maximum clarity, these types are explicitly partitioned into Call-Level and Attempt-Level scopes, corresponding to their respective duration histograms. Structural container policies may compose the attempt-level values by prepending logical prefixes.
+The `grpc.delay_type` label is a low-cardinality, restricted set of values. These types are partitioned into Call-Level and Attempt-Level scopes, corresponding to their respective duration histograms. Structural container policies may compose the attempt-level values by prepending logical prefixes.
 
 ##### 1. Call-Level Delay Types
 Recorded on the `grpc.client.call.delay.duration` histogram. These represent delays that occur before an individual attempt is created:
@@ -127,24 +127,24 @@ Structural container policies prepend their logical prefixes to the base attempt
     *   `p0:connecting`
     *   `p1:subchannel_state_mismatch`
     *   `p0:picker_failing_with_wait_for_ready`
-*   **Pass-Through Container Policies**: Policies like `xds_cluster_manager`, `weighted_target`, and `rls` **do not prepend any prefix or wrap the delay type**. They simply bubble up the child's `grpc.delay_type` (e.g., `"connecting"`) directly as-is.
+*   **Pass-Through Container Policies**: Policies like `xds_cluster_manager`, `weighted_target`, and `rls` **do not prepend any prefix or wrap the delay type**. They bubble up the child's `grpc.delay_type` (e.g., `"connecting"`) as-is.
 
-Because only the priority policy contributes a prefix and it contributes exactly one (its active tier index), the resulting `grpc.delay_type` cardinality stays bounded at roughly *(base attempt-level types) × (configured priority tiers)*; prefixes do not stack across nested pass-through containers. Implementations SHOULD keep the prefix a small bounded token (the tier index) so metric cardinality remains low; richer per-container structure belongs in the `grpc.delay_reason` span event, not the metric label.
+Because only the priority policy contributes a prefix and it contributes exactly one (its active tier index), the resulting `grpc.delay_type` cardinality stays bounded; prefixes do not stack across nested pass-through containers. Implementations SHOULD keep the prefix a small bounded token (the tier index) so metric cardinality remains low; detailed per-container structure belongs in the `grpc.delay_reason` span event, not the metric label.
 
 ##### Metadata Propagation & Composition
-The prepending and wrapping logic is handled entirely inside the Balancer Picker tree hierarchy, keeping the channel's attempt-routing wrapper and tracer plugins completely decoupled and simple:
-1.  **Leaf Pickers** (such as `pick_first` or `round_robin`): Generate the base leaf types (e.g., `delay_type = "connecting"`) and the initial, descriptive `delay_reason` (e.g., `"subchannel connecting: TCP handshake in progress"`).
-2.  **Container Pickers**: Intercept the child's deferred pick result as it bubbles up the picker tree. The `priority` picker prepends its active tier index to the type (e.g., producing `"p0:connecting"`). A pass-through picker (such as `xds_cluster_manager`) forwards the child's `delay_type` unmodified, but can enrich the `delay_reason` with its own structural details.
-3.  **The Channel Wrapper**: Receives the final, fully-composed `delay_type` and `delay_reason` strings from the root picker and passes them directly to the tracer (`recordAttemptDelayStart`). The channel wrapper is also responsible for intercepting specific channel-level states (e.g., generating `"picker_failing_with_wait_for_ready"` when a picker returns an error for a `wait_for_ready` RPC, or `"subchannel_state_mismatch"` when a transport disconnects before the picker is updated).
+The prepending and wrapping logic is handled entirely inside the balancer picker tree, keeping the channel's attempt-routing wrapper and tracer plugins decoupled:
+1.  **Leaf Pickers** (such as `pick_first` or `round_robin`): Generate the base leaf types (e.g., `delay_type = "connecting"`) and the initial `delay_reason` (e.g., `"subchannel connecting: TCP handshake in progress"`).
+2.  **Container Pickers**: Intercept the child's deferred pick result as it bubbles up the picker tree. The `priority` picker prepends its active tier index to the type (e.g., producing `"p0:connecting"`). A pass-through picker (such as `xds_cluster_manager`) forwards the child's `delay_type` unmodified, but can add its own structural details to the `delay_reason`.
+3.  **The Channel Wrapper**: Receives the composed `delay_type` and `delay_reason` strings from the root picker and passes them to the tracer (`recordAttemptDelayStart`). The channel wrapper is also responsible for intercepting specific channel-level states (e.g., generating `"picker_failing_with_wait_for_ready"` when a picker returns an error for a `wait_for_ready` RPC, or `"subchannel_state_mismatch"` when a transport disconnects before the picker is updated).
 
 ---
 
 #### 2. Taxonomy of Delay Reasons (Span Event Attribute: `grpc.delay_reason`)
-Unlike the strict, low-cardinality metric types, the `grpc.delay_reason` is an **unconstrained, free-form debug string** designed to convey maximum troubleshooting context. 
+Unlike the strict, low-cardinality metric types, the `grpc.delay_reason` is an **unconstrained, free-form debug string** designed to convey troubleshooting context. 
 *   It is written as a **human-readable, spaced string** (e.g. `"subchannel is connecting"` or `"waiting for DNS query to complete"`), **not** a `snake_case` token or closed enum.
-*   It is designed to contain **high-cardinality metadata** (such as specific subchannel IP addresses, target names, cache keys, or raw connection error messages) to provide rich diagnostics inside the trace span.
+*   It is designed to contain **high-cardinality metadata** (such as specific subchannel IP addresses, target names, cache keys, or raw connection error messages) to provide diagnostics inside the trace span.
 
-To assist implementers, we explain the physical scenarios that are associated with each `grpc.delay_type` below. These scenarios represent common connection/resolver bottlenecks but are **non-exhaustive**; implementations are encouraged to append additional debug details.
+To assist implementers, we explain the scenarios associated with each `grpc.delay_type` below. These scenarios represent common connection/resolver bottlenecks but are **non-exhaustive**; implementations are encouraged to append additional debug details.
 
 ##### Category A: Resolver Scenarios (Type: `"resolving"`)
 *   **DNS Resolver Pending**: The channel is waiting for the initial name resolution query to complete. The reason string should describe the pending resolver query (e.g., `"waiting for DNS query to complete for target example.com"`).
@@ -172,7 +172,7 @@ Recorded when an RPC attempt is queued waiting for a subchannel to establish a t
 The priority load balancing policy ([gRPC A56][A56]) manages failover between multiple priority groups (e.g. `p0`, `p1`, `p2`). Its delay telemetry behaves as follows:
 *   When the priority policy is waiting on its primary tier (`p0`) to connect, the overall metric delay type is `"p0:connecting"`.
 *   If `p0` fails (enters `TRANSIENT_FAILURE`) and the policy fails over to `p1`, the picker updates the active delay type to `"p1:connecting"`.
-*   Because the delay type has transitioned, the active child span is closed, a new child span `"p1:connecting"` is opened, and the picker records the exact failover reason as a spaced string event (which can include the logical priority name or child policy name from the configuration, e.g., `"waiting on priority group p1 (child 'tier-1-backup') (p0 failed: connection timeout)"`). This provides a clear, high-fidelity timeline of the failover sequence in the trace.
+*   Because the delay type has transitioned, the active child span is closed, a new child span `"p1:connecting"` is opened, and the picker records the exact failover reason as a spaced string event (which can include the logical priority name or child policy name from the configuration, e.g., `"waiting on priority group p1 (child 'tier-1-backup') (p0 failed: connection timeout)"`). This provides a timeline of the failover sequence in the trace.
 
 ##### Category F: Pass-Through Container Policy Scenarios (Type: `"connecting"` bubbled up directly)
 Policies like `xds_cluster_manager`, `weighted_target`, and `rls` do not modify the metric `grpc.delay_type` (it remains strictly `"connecting"` or whatever leaf type is bubbled up from the child).
@@ -192,33 +192,43 @@ The channel owns the **lifecycle** of a delay segment (deciding when it starts, 
 *   **Scope Resolution**: The decision of whether a delay segment is Call-Level (recorded to `grpc.client.call.delay.duration`) or Attempt-Level (recorded to `grpc.client.attempt.delay.duration`) is determined entirely by the scope of the tracer object on which the callbacks are invoked. Call-level delays (such as `"resolving"`) are invoked strictly on the call-scoped tracer object, while attempt-level delays (such as `"connecting"`) are invoked strictly on the attempt-scoped tracer object. This mapping is enforced statically by the respective language API signatures.
 
 ##### 2. Emission
-Both metric duration recording and trace span management are fully delegated to the registered telemetry plugin (e.g., OpenTelemetry) via the tracer API:
+Both metric duration recording and trace span management are delegated to the registered telemetry plugin (e.g., OpenTelemetry) via the tracer API:
 *   **Span Lifecycle**: Upon receiving the `recordDelayStart` signal, the telemetry plugin instantiates the child trace span. Subsequent `recordDelayReasonChanged` calls append `"Delay state transition"` events to the active span.
 *   **Simultaneous Metric & Span Close**: Upon receiving the `recordDelayEnd` signal, the telemetry plugin **simultaneously ends the child trace span and emits the final duration metric** to the corresponding duration histogram (`grpc.client.call.delay.duration` or `grpc.client.attempt.delay.duration`), measuring the elapsed time of the logical timer.
 
 ##### 3. Cancellation & Timeout
 If an active RPC call or attempt is cancelled (due to client cancellation, `DEADLINE_EXCEEDED` timeouts, or channel shutdown) while a delay is logically active:
 *   The core channel **MUST** invoke the tracer's end callback (`recordCallDelayEnd()` or `recordAttemptDelayEnd()`), which finalizes the plugin-side timing for the open segment. 
-*   This ensures the telemetry plugin can capture the elapsed duration up to the point of failure, close the trace span, and emit the partial duration metric, guaranteeing that bottlenecks preceding a failure remain fully observable.
+*   This ensures the telemetry plugin can capture the elapsed duration up to the point of failure, close the trace span, and emit the partial duration metric, guaranteeing that bottlenecks preceding a failure remain observable.
 
 ##### 4. Retries & Hedging
 Each RPC attempt is tracked independently:
 *   **Attempt Isolation**: A transparent retry or hedged attempt will instantiate its own attempt-level tracer. 
 *   **Independent Timing**: If the new attempt's picker is deferred, the attempt starts its own independent delay logical timer and child trace span, without affecting the call-level resolver timing or the timing of other concurrent attempts.
 
+##### 5. Attempt-Level Channel-Intercepted Delays
+Some attempt-level delays are not generated by load-balancing pickers but are intercepted and synthesized by the channel wrapper when handling transport-level states:
+*   **`picker_failing_with_wait_for_ready` (Wait-For-Ready Buffering)**:
+    1.  *Trigger*: When an RPC is initiated and the root picker returns a failing result (an error other than "no connection available"), the channel wrapper checks the RPC's `wait_for_ready` configuration. If `wait_for_ready` is `false`, the RPC fails immediately (no delay is timed). If `wait_for_ready` is `true`, the channel wrapper queues the RPC and invokes `recordAttemptDelayStart("picker_failing_with_wait_for_ready", error_reason)`.
+    2.  *Transition*: While the RPC remains queued, if an updated picker continues to return a different error, the channel wrapper updates the reason via `recordAttemptDelayReasonChanged(new_error_reason)`.
+    3.  *Termination*: When an updated picker assigns a ready subchannel, the channel wrapper invokes `recordAttemptDelayEnd()` and creates the stream. If the RPC's deadline expires or the call is cancelled while queued, the channel wrapper invokes `recordAttemptDelayEnd()` to capture the partial duration.
+*   **`subchannel_state_mismatch` (Post-Pick Stale Pick)**:
+    1.  *Trigger*: When the root picker returns a successful pick but the assigned subchannel has transitioned out of `READY` before the RPC can use it (a race before the picker is updated), the channel wrapper re-queues the RPC on the same attempt and invokes `recordAttemptDelayStart("subchannel_state_mismatch", state_change_reason)`. It then waits for the next picker and re-picks; no new attempt is created.
+    2.  *Termination*: When a re-pick assigns a subchannel that is actually ready, the channel wrapper invokes `recordAttemptDelayEnd()`. If the deadline expires or the call is cancelled while re-queued, the channel wrapper invokes `recordAttemptDelayEnd()` to capture the partial duration.
+
 #### API Definitions
 
 ##### 1. Picker-Side API
-When a picker defers a pick (it cannot return a ready connection yet), it surfaces two optional values **alongside the existing "no connection available" deferral signal**, carried on the runtime's existing pick-result value so that no new return channel is introduced:
+When a picker defers a pick (it cannot return a ready connection yet), it surfaces two values **alongside the existing "no connection available" deferral signal**, carried on the runtime's existing pick-result value so that no new return channel is introduced:
 *   `delay_type`: the bounded metric label for the current wait (e.g. `"connecting"`), composed by container pickers per §2.
 *   `delay_reason`: the free-form diagnostic string for the current wait.
 
 The channel reads these only on the deferred path; a successful pick ignores them. Leaf pickers populate the base values and container pickers compose them as the result bubbles up the picker tree (§2). Pickers remain ignorant of `wait_for_ready` semantics and transport races — the channel itself synthesizes `picker_failing_with_wait_for_ready` and `subchannel_state_mismatch` (§2, Rationale).
 
-Concretely, each runtime carries the two values on the deferred case of the pick-result type it already returns:
-*   **Go**: two new optional fields on `balancer.PickResult`. A deferred pick is signalled by returning the `ErrNoSubConnAvailable` sentinel error (the `PickResult` is otherwise empty today); the picker additionally populates the two fields on that returned `PickResult`, and `pickerWrapper.pick` reads them on the `ErrNoSubConnAvailable` branch before it loops to await the next picker. The end of the wait reuses the existing `pick.blocked` → `stats.DelayedPickComplete` signal.
-*   **Java**: two new fields on `PickResult`, set via a new no-result factory — the buffered-pick case is `PickResult.withNoResult()` (`subchannel == null`, `status == OK`) — read where the channel interprets a buffered pick. `PickResult` already transports an LB-supplied `ClientStreamTracer.Factory`, so this extends an established per-pick carrier.
-*   **C++ (Core)**: `SubchannelPicker::Pick(PickArgs)` already returns a `PickResult` variant whose `Queue` case denotes a deferred pick (the channel queues the call and re-picks on the next picker update). The two values are added to the `PickResult::Queue` struct — today an empty struct — exactly mirroring the Go and Java additions; container pickers (e.g. `priority`) compose them as the `PickResult` is returned up the picker tree.
+Add two fields to the pick-result type each runtime already returns. Leaf pickers set them when they defer; container pickers (e.g. `priority`) propagate and compose them as the deferred result bubbles up (§2); the channel reads them where it already handles a deferred pick. No new return channel and no pick-loop restructuring are introduced. The fields live on:
+*   **Go**: `balancer.PickResult` (deferred pick = the `ErrNoSubConnAvailable` return).
+*   **Java**: `PickResult` (deferred pick = `PickResult.withNoResult()`).
+*   **C++ (Core)**: the `PickResult::Queue` variant (deferred pick = `Queue`).
 
 ##### 2. Tracer-Side API
 
@@ -241,15 +251,15 @@ The **scope of the receiving tracer object** (call-scoped vs attempt-scoped) sta
 | Attempt-level delay hooks | a **new** attempt-scoped tracer (new V2 stats-handler API) | new methods on the existing `ClientStreamTracer` (attempt-scoped) | new `DelayAnnotation` subtype recorded on the existing attempt tracer |
 
 ###### Per-runtime binding
-The binding *mechanism* is deliberately asymmetric, because each runtime's current telemetry API differs; only the six logical operations and their two scopes are common. This asymmetry is inherent to the existing APIs, not a difference in the delay design itself:
-*   **Go**: introduces a **new** call-scoped and attempt-scoped tracer API (gRPC-Go's V2 stats handler). A new API is required because the V1 `stats.Handler` is attempt-scoped only and cannot host a call-level hook. (The closest existing V1 signal, `stats.DelayedPickComplete`, is attempt-scoped and merely marks the *end* of a blocked pick — it is an analogue, not a base we extend.) The broader V2 API is out of scope here beyond the delay hooks it must expose.
-*   **Java**: **reuses the existing tracer types** but adds new no-op-default methods to them — attempt hooks on `ClientStreamTracer`, call hooks on `ClientStreamTracer.Factory` — and genuinely reuses the existing name-resolution-delay plumbing (`ClientStreamTracer.NAME_RESOLUTION_DELAYED` and the `createPendingStream()` callback) for the `"resolving"` segment. Because no attempt-level `ClientStreamTracer` instance exists while an RPC is buffered waiting on a pick, a buffered-pick (`"connecting"`) delay is anchored on the call-scoped `Factory` until the stream is created.
+The binding *mechanism* is asymmetric because each runtime's current telemetry API differs; only the six logical operations and their two scopes are common. This asymmetry is inherent to the existing APIs, not a difference in the delay design itself:
+*   **Go**: introduces a **new** call-scoped and attempt-scoped tracer API (gRPC-Go's V2 stats handler). A new API is required because the V1 `stats.Handler` is attempt-scoped only and cannot host a call-level hook. The broader V2 API is out of scope here beyond the delay hooks it must expose.
+*   **Java**: **reuses the existing tracer types** but adds new no-op-default methods to them — attempt hooks on `ClientStreamTracer`, call hooks on `ClientStreamTracer.Factory` — and reuses the existing name-resolution-delay plumbing (`ClientStreamTracer.NAME_RESOLUTION_DELAYED` and the `createPendingStream()` callback) for the `"resolving"` segment. Because no attempt-level `ClientStreamTracer` instance exists while an RPC is buffered waiting on a pick, a buffered-pick (`"connecting"`) delay is anchored on the call-scoped `Factory` until the stream is created.
 *   **C++ (Core)**: **reuses the existing annotation framework**, adding only a new `DelayAnnotation` subtype that replaces the current free-form `"Delayed name resolution complete."` / `"Delayed LB pick complete."` string annotations.
 
 In short: C++ reuses its mechanism wholesale (one new subtype), Java reuses its tracer types but extends them with new methods, and Go introduces new tracer types outright.
 
 ###### Illustrative binding: C++ structured annotation
-To avoid adding new virtual methods to the core tracer interface, the delay transition is carried as an `Annotation` subtype on the existing annotation framework. It implements **both** pure-virtual hooks of the base `Annotation` — `ToString()` (human-readable form) and `ForEachKeyValue()` (structured `grpc.delay_type`/`grpc.delay_reason` pairs) — and **owns** its strings so the annotation may safely outlive the stack frame that produced it:
+Rather than add new virtual methods to the core tracer interface, the delay transition is carried as an `Annotation` subtype that owns its strings:
 ```cpp
 namespace grpc_core {
 
@@ -272,14 +282,14 @@ class DelayAnnotation final : public CallTracerAnnotationInterface::Annotation {
       const override;
 
  private:
-  Stage stage_;
-  std::string type_;    // owned (not a string_view) to avoid a dangling view
-  std::string reason_;  // owned
+  const Stage stage_;
+  const std::string type_;    // owned (not a string_view) to avoid dangling
+  const std::string reason_;  // owned
 };
 
 }  // namespace grpc_core
 ```
-A new `AnnotationType::kDelay` is added to the annotation-type enum (before the trailing `kDoNotUse_MustBeLast` sentinel). Plugins consume the structured fields via `ForEachKeyValue` to populate span attributes; plugins that only call `ToString()` continue to work unchanged. Making the structured labels observable does require the OpenTelemetry plugin to read `kDelay` via `ForEachKeyValue` — a `ToString()`-only path would otherwise collapse `delay_type` and `delay_reason` into one opaque string and lose the metric-label/diagnostic separation this design depends on.
+A new `AnnotationType::kDelay` is added to the annotation-type enum (before the trailing `kDoNotUse_MustBeLast` sentinel). The OpenTelemetry plugin reads `stage()`/`type()`/`reason()` to open, update, and close the delay child span.
 
 ### Feature Flag
 
@@ -298,9 +308,9 @@ Metric registration and recording will follow the established architectural patt
 
 **Child Spans vs. Events:** We use child spans for delays instead of attaching events to the parent RPC span because it provides better visual flame-graph isolation in tracing backends, especially when delays are long or when multiple attempts are made (e.g., hedging or retries).
 
-**Free-form `delay_reason`:** We explicitly chose to allow unconstrained, free-form debug strings for the trace event's `delay_reason` rather than bounded enum tokens. While this risks higher cardinality in tracing backends, it provides immense diagnostic value by allowing raw IP addresses, subchannel targets, and detailed connection error messages to be embedded directly into the trace. The metric label (`grpc.delay_type`) remains strictly bounded to ensure metric cardinality is kept low.
+**Free-form `delay_reason`:** We allow unconstrained, free-form debug strings for the trace event's `delay_reason` rather than bounded enum tokens. While this risks higher cardinality in tracing backends, it provides diagnostic value by allowing raw IP addresses, subchannel targets, and detailed connection error messages to be embedded directly into the trace. The metric label (`grpc.delay_type`) remains strictly bounded to ensure metric cardinality is kept low.
 
-**Channel-Intercepted Delays:** We implement specific delay types like `picker_failing_with_wait_for_ready` and `subchannel_state_mismatch` as channel-level interceptions rather than picker-generated types. This intentionally keeps leaf pickers ignorant of `wait_for_ready` semantics and transport-level race conditions, enforcing a clean separation of concerns where the picker only reports its current state, and the channel dictates queueing behavior.
+**Channel-Intercepted Delays:** We implement specific delay types like `picker_failing_with_wait_for_ready` and `subchannel_state_mismatch` as channel-level interceptions rather than picker-generated types. This keeps leaf pickers ignorant of `wait_for_ready` semantics and transport-level race conditions, enforcing a separation of concerns where the picker only reports its current state, and the channel dictates queueing behavior.
 
 **Delegated Recording:** We implement duration recording at the client channel wrapper level rather than inside specific load balancing policies because only the client channel manages the buffering, queueing, and context cancellation lifecycles of RPC calls. This decouples policy-level state reporting from duration measurement.
 
