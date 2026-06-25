@@ -233,20 +233,20 @@ The channel drives the telemetry plugin through six logical operations, split ac
 | `recordAttemptDelayReasonChanged(reason)` | attempt | append a `"Delay state transition"` event |
 | `recordAttemptDelayEnd()` | attempt | close the span; emit `grpc.client.attempt.delay.duration` |
 
-The **scope of the receiving tracer object** (call-scoped vs attempt-scoped) statically determines which histogram a segment is recorded to (§3.1, Scope Resolution). Each runtime binds these operations onto its existing client-side telemetry types rather than introducing a parallel stack:
+The **scope of the receiving tracer object** (call-scoped vs attempt-scoped) statically determines which histogram a segment is recorded to (§3.1, Scope Resolution). Each runtime binds these operations onto its client-side telemetry API as follows:
 
 | Scope | Go | Java | C++ (Core) |
 |---|---|---|---|
-| Call-level delay hooks | a call-scoped tracer | `ClientStreamTracer.Factory` (call-scoped, plumbed through the channel) | `DelayAnnotation` recorded on the call tracer |
-| Attempt-level delay hooks | an attempt-scoped tracer | `ClientStreamTracer` (attempt-scoped) | `DelayAnnotation` recorded on the attempt tracer |
+| Call-level delay hooks | a **new** call-scoped tracer (new V2 stats-handler API) | new methods on the existing `ClientStreamTracer.Factory` (call-scoped, plumbed through the channel) | new `DelayAnnotation` subtype recorded on the existing call tracer |
+| Attempt-level delay hooks | a **new** attempt-scoped tracer (new V2 stats-handler API) | new methods on the existing `ClientStreamTracer` (attempt-scoped) | new `DelayAnnotation` subtype recorded on the existing attempt tracer |
 
-In every runtime these are additive, no-op-default hooks layered onto existing tracer types, consistent with how those types already expose optional lifecycle callbacks; they do not require replacing any existing telemetry interface.
+###### Per-runtime binding
+The binding *mechanism* is deliberately asymmetric, because each runtime's current telemetry API differs; only the six logical operations and their two scopes are common. This asymmetry is inherent to the existing APIs, not a difference in the delay design itself:
+*   **Go**: introduces a **new** call-scoped and attempt-scoped tracer API (gRPC-Go's V2 stats handler). A new API is required because the V1 `stats.Handler` is attempt-scoped only and cannot host a call-level hook. (The closest existing V1 signal, `stats.DelayedPickComplete`, is attempt-scoped and merely marks the *end* of a blocked pick — it is an analogue, not a base we extend.) The broader V2 API is out of scope here beyond the delay hooks it must expose.
+*   **Java**: **reuses the existing tracer types** but adds new no-op-default methods to them — attempt hooks on `ClientStreamTracer`, call hooks on `ClientStreamTracer.Factory` — and genuinely reuses the existing name-resolution-delay plumbing (`ClientStreamTracer.NAME_RESOLUTION_DELAYED` and the `createPendingStream()` callback) for the `"resolving"` segment. Because no attempt-level `ClientStreamTracer` instance exists while an RPC is buffered waiting on a pick, a buffered-pick (`"connecting"`) delay is anchored on the call-scoped `Factory` until the stream is created.
+*   **C++ (Core)**: **reuses the existing annotation framework**, adding only a new `DelayAnnotation` subtype that replaces the current free-form `"Delayed name resolution complete."` / `"Delayed LB pick complete."` string annotations.
 
-###### Building on existing per-runtime primitives
-Each runtime already exposes adjacent delay signals; the implementation extends these rather than introducing duplicate mechanisms:
-*   **Go**: `stats.DelayedPickComplete` already marks the *end* of a blocked pick; the attempt-level delay generalizes it with a start signal and the `delay_type`/`delay_reason` payload. The existing attempt-scoped stats events have no hook that spans attempts or precedes the first attempt, so the call-scoped `"resolving"` hooks require a call-scoped tracer; gRPC-Go exposes this through a call-scoped tracer in its evolving stats-handler surface (the broader evolution of that surface is out of scope here beyond the delay hooks it must expose).
-*   **Java**: name-resolution delay is already measured and surfaced via the `ClientStreamTracer.NAME_RESOLUTION_DELAYED` call option and the `createPendingStream()` callback; the `"resolving"` call-delay hooks build on that pending-stream path. Note also that while an RPC is buffered waiting on a pick, no attempt-level `ClientStreamTracer` instance exists yet, so a buffered-pick (`"connecting"`) delay is anchored on the call-scoped `Factory` until the stream is created.
-*   **C++ (Core)**: core already records `"Delayed name resolution complete."` and `"Delayed LB pick complete."` as free-form string annotations; these are replaced by the structured `DelayAnnotation` below.
+In short: C++ reuses its mechanism wholesale (one new subtype), Java reuses its tracer types but extends them with new methods, and Go introduces new tracer types outright.
 
 ###### Illustrative binding: C++ structured annotation
 To avoid adding new virtual methods to the core tracer interface, the delay transition is carried as an `Annotation` subtype on the existing annotation framework. It implements **both** pure-virtual hooks of the base `Annotation` — `ToString()` (human-readable form) and `ForEachKeyValue()` (structured `grpc.delay_type`/`grpc.delay_reason` pairs) — and **owns** its strings so the annotation may safely outlive the stack frame that produced it:
