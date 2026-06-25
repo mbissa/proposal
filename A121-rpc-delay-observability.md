@@ -218,7 +218,7 @@ The channel reads these only on the deferred path; a successful pick ignores the
 Concretely, each runtime extends the type it already uses to express a deferred pick:
 *   **Go**: two optional fields on `balancer.PickResult`. Because a deferred pick is signalled today through the `ErrNoSubConnAvailable` sentinel rather than a populated `PickResult`, the deferred path is extended to also surface a populated result carrying the delay metadata to the pick wrapper.
 *   **Java**: carried on `PickResult` (which already transports an LB-supplied `ClientStreamTracer.Factory`), read where the channel interprets a no-result pick.
-*   **C++ (Core)**: core has no synchronous picker-tree return to a channel wrapper, so the equivalent `delay_type`/`delay_reason` are recorded at the LB-pick point of the call's promise chain rather than returned upward (see Tracer-Side API).
+*   **C++ (Core)**: `SubchannelPicker::Pick(PickArgs)` already returns a `PickResult` variant whose `Queue` case denotes a deferred pick (the channel queues the call and re-picks on the next picker update). The two values are added to the `PickResult::Queue` struct — today an empty struct — exactly mirroring the Go and Java additions; container pickers (e.g. `priority`) compose them as the `PickResult` is returned up the picker tree.
 
 ##### 2. Tracer-Side API
 
