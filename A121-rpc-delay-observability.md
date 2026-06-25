@@ -3,7 +3,7 @@
 * Author(s): Madhav Bissa (@mbissa)
 * Approver: @markdroth, @ejona86, @dfawley, @easwars
 * Implemented in: Go, Java, C++
-* Last updated: 2026-06-19
+* Last updated: 2026-06-25
 * Discussion at: <google group thread> (filled after thread exists)
 
 ## Abstract
@@ -129,6 +129,8 @@ Structural container policies prepend their logical prefixes to the base attempt
     *   `p0:picker_failing_with_wait_for_ready`
 *   **Pass-Through Container Policies**: Policies like `xds_cluster_manager`, `weighted_target`, and `rls` **do not prepend any prefix or wrap the delay type**. They simply bubble up the child's `grpc.delay_type` (e.g., `"connecting"`) directly as-is.
 
+Because only the priority policy contributes a prefix and it contributes exactly one (its active tier index), the resulting `grpc.delay_type` cardinality stays bounded at roughly *(base attempt-level types) × (configured priority tiers)*; prefixes do not stack across nested pass-through containers. Implementations SHOULD keep the prefix a small bounded token (the tier index) so metric cardinality remains low; richer per-container structure belongs in the `grpc.delay_reason` span event, not the metric label.
+
 ##### Metadata Propagation & Composition
 The prepending and wrapping logic is handled entirely inside the Balancer Picker tree hierarchy, keeping the channel's attempt-routing wrapper and tracer plugins completely decoupled and simple:
 1.  **Leaf Pickers** (such as `pick_first` or `round_robin`): Generate the base leaf types (e.g., `delay_type = "connecting"`) and the initial, descriptive `delay_reason` (e.g., `"subchannel connecting: TCP handshake in progress"`).
@@ -184,8 +186,9 @@ However, to provide visibility in tracing, the parent container policy's structu
 The client channel, load balancer, and telemetry tracer coordinate synchronously to record delays without dynamic memory allocation during routing.
 
 ##### 1. Timer Orchestration
-*   **Resolver / Control-Plane (Call-Level Delay)**: When an RPC is blocked waiting for name resolution or configuration parsing to complete, the channel starts a logical timer and invokes `recordCallDelayStart("resolving", reason)` to create the `"Call Delay"` child span carrying the `grpc.delay_type = "resolving"` attribute. When the resolver successfully applies the first valid service config and endpoints, the channel stops the logical timer and invokes `recordCallDelayEnd()`. (Note: If resolution completes before any RPC is blocked, no delay is recorded.)
-*   **LB Picker (Attempt-Level Delay)**: When an RPC attempt is initiated, the picker executes. If the picker defers the pick (e.g. returning `ErrNoSubConnAvailable`), it returns a pending result containing the metric delay type (e.g., `"connecting"`) and the free-form debug reason. The channel's attempt-routing wrapper starts a logical timer and invokes `recordAttemptDelayStart(type, reason)` to create the `"Attempt Delay"` child span. As the attempt remains buffered, subsequent picker evaluations may return different reasons, which the channel updates using `recordAttemptDelayReasonChanged(reason)` to append span events. When a picker evaluation successfully assigns a subchannel, the channel stops the logical timer and invokes `recordAttemptDelayEnd()`.
+The channel owns the **lifecycle** of a delay segment (deciding when it starts, transitions, and ends) while the telemetry plugin owns the **timing** of that segment (it timestamps the start on `recordDelayStart`, computes the elapsed duration on `recordDelayEnd`, and emits the histogram). The channel therefore does not maintain a separate duration clock; "logical timer" below refers to this plugin-side measurement, delimited by the channel's start/end signals.
+*   **Resolver / Control-Plane (Call-Level Delay)**: When an RPC is blocked waiting for name resolution or configuration parsing to complete, the channel invokes `recordCallDelayStart("resolving", reason)` to open the `"Call Delay"` child span carrying the `grpc.delay_type = "resolving"` attribute. When the resolver successfully applies the first valid service config and endpoints, the channel invokes `recordCallDelayEnd()`. (Note: If resolution completes before any RPC is blocked, no delay is recorded.)
+*   **LB Picker (Attempt-Level Delay)**: When an RPC attempt is initiated, the picker executes. If the picker defers the pick (i.e. it cannot return a ready connection yet), it surfaces the metric delay type (e.g., `"connecting"`) and the free-form debug reason alongside the existing "no connection available" signal. The channel's attempt-routing wrapper invokes `recordAttemptDelayStart(type, reason)` to open the `"Attempt Delay"` child span. As the attempt remains buffered, subsequent picker evaluations may return different reasons, which the channel updates using `recordAttemptDelayReasonChanged(reason)` to append span events. When a picker evaluation successfully assigns a subchannel, the channel invokes `recordAttemptDelayEnd()`.
 *   **Scope Resolution**: The decision of whether a delay segment is Call-Level (recorded to `grpc.client.call.delay.duration`) or Attempt-Level (recorded to `grpc.client.attempt.delay.duration`) is determined entirely by the scope of the tracer object on which the callbacks are invoked. Call-level delays (such as `"resolving"`) are invoked strictly on the call-scoped tracer object, while attempt-level delays (such as `"connecting"`) are invoked strictly on the attempt-scoped tracer object. This mapping is enforced statically by the respective language API signatures.
 
 ##### 2. Emission
@@ -195,8 +198,7 @@ Both metric duration recording and trace span management are fully delegated to 
 
 ##### 3. Cancellation & Timeout
 If an active RPC call or attempt is cancelled (due to client cancellation, `DEADLINE_EXCEEDED` timeouts, or channel shutdown) while a delay is logically active:
-*   The core channel **MUST** stop the logical timer.
-*   The core channel **MUST** invoke the tracer's end callback (`recordCallDelayEnd()` or `recordAttemptDelayEnd()`). 
+*   The core channel **MUST** invoke the tracer's end callback (`recordCallDelayEnd()` or `recordAttemptDelayEnd()`), which finalizes the plugin-side timing for the open segment. 
 *   This ensures the telemetry plugin can capture the elapsed duration up to the point of failure, close the trace span, and emit the partial duration metric, guaranteeing that bottlenecks preceding a failure remain fully observable.
 
 ##### 4. Retries & Hedging
@@ -207,203 +209,84 @@ Each RPC attempt is tracked independently:
 #### API Definitions
 
 ##### 1. Picker-Side API
-Pickers must pass the `delay_type` and `delay_reason` metadata back to the channel when they defer a pick as part of the Pick Result.
+When a picker defers a pick (it cannot return a ready connection yet), it surfaces two optional values **alongside the existing "no connection available" deferral signal**, carried on the runtime's existing pick-result value so that no new return channel is introduced:
+*   `delay_type`: the bounded metric label for the current wait (e.g. `"connecting"`), composed by container pickers per §2.
+*   `delay_reason`: the free-form diagnostic string for the current wait.
+
+The channel reads these only on the deferred path; a successful pick ignores them. Leaf pickers populate the base values and container pickers compose them as the result bubbles up the picker tree (§2). Pickers remain ignorant of `wait_for_ready` semantics and transport races — the channel itself synthesizes `picker_failing_with_wait_for_ready` and `subchannel_state_mismatch` (§2, Rationale).
+
+Concretely, each runtime extends the type it already uses to express a deferred pick:
+*   **Go**: two optional fields on `balancer.PickResult`. Because a deferred pick is signalled today through the `ErrNoSubConnAvailable` sentinel rather than a populated `PickResult`, the deferred path is extended to also surface a populated result carrying the delay metadata to the pick wrapper.
+*   **Java**: carried on `PickResult` (which already transports an LB-supplied `ClientStreamTracer.Factory`), read where the channel interprets a no-result pick.
+*   **C++ (Core)**: core has no synchronous picker-tree return to a channel wrapper, so the equivalent `delay_type`/`delay_reason` are recorded at the LB-pick point of the call's promise chain rather than returned upward (see Tracer-Side API).
 
 ##### 2. Tracer-Side API
 
-##### Go (Experimental V2 Stats Handler Framework)
-In gRPC-Go, the current `stats.Handler` interface has several critical limitations that prevent it from supporting modern telemetry needs and call-level observability:
-1.  **Strictly Attempt-Scoped**: All RPC events in `stats.Handler` (`TagRPC`, `HandleRPC`) are executed on individual HTTP/2 streams (attempts). There is no "Call-scoped" hook to track milestones that span multiple attempts or occur before an attempt is created (such as DNS name resolution, configuration parsing, or RLS control-plane queries).
-2.  **Type-Assertion Overhead**: The V1 `HandleRPC(context.Context, RPCStats)` method passes stats via the empty interface `RPCStats`. Implementations must perform runtime type assertions (e.g. `switch s := stat.(type)`) to process events. This degrades CPU performance and prevents compile-time contract enforcement.
-3.  **Dynamic Memory Allocations**: Wrapping every telemetry event in a struct (e.g. `stats.Begin`, `stats.InPayload`) and casting it to `RPCStats` requires heap allocations, which adds garbage collection pressure in high-throughput RPC paths.
-4.  **Coupled Connection & RPC Lifecycles**: Connection-level stats and RPC-level stats are mixed in a single interface, preventing modular plugin registration.
+The channel drives the telemetry plugin through six logical operations, split across the two existing telemetry scopes. The end callbacks carry no duration argument because the plugin owns timing (§3.1):
 
-To completely replace the V1 stats handler with a high-performance, pluggable, and fully observable framework, gRPC-Go will introduce a new **V2 Stats Handler** framework as part of the existing `google.golang.org/grpc/stats` package. The V2 framework moves away from V1's struct-based event bubbling and adopts a **direct method/callback-based interface** with three isolated tracer scopes, decorated with standard Go experimental doc comments.
+| Logical operation | Scope | Effect |
+|---|---|---|
+| `recordCallDelayStart(delay_type, reason)` | call | open the `"Call Delay"` span; begin timing |
+| `recordCallDelayReasonChanged(reason)` | call | append a `"Delay state transition"` event |
+| `recordCallDelayEnd()` | call | close the span; emit `grpc.client.call.delay.duration` |
+| `recordAttemptDelayStart(delay_type, reason)` | attempt | open the `"Attempt Delay"` span; begin timing |
+| `recordAttemptDelayReasonChanged(reason)` | attempt | append a `"Delay state transition"` event |
+| `recordAttemptDelayEnd()` | attempt | close the span; emit `grpc.client.attempt.delay.duration` |
 
-###### 1. Interface Definitions in `google.golang.org/grpc/stats`
+The **scope of the receiving tracer object** (call-scoped vs attempt-scoped) statically determines which histogram a segment is recorded to (§3.1, Scope Resolution). Each runtime binds these operations onto its existing client-side telemetry types rather than introducing a parallel stack:
 
-```go
-package stats
+| Scope | Go | Java | C++ (Core) |
+|---|---|---|---|
+| Call-level delay hooks | a call-scoped tracer | `ClientStreamTracer.Factory` (call-scoped, plumbed through the channel) | `DelayAnnotation` recorded on the call tracer |
+| Attempt-level delay hooks | an attempt-scoped tracer | `ClientStreamTracer` (attempt-scoped) | `DelayAnnotation` recorded on the attempt tracer |
 
-import (
-	"context"
-	"net"
-	"time"
+In every runtime these are additive, no-op-default hooks layered onto existing tracer types, consistent with how those types already expose optional lifecycle callbacks; they do not require replacing any existing telemetry interface.
 
-	"google.golang.org/grpc/metadata"
-)
+###### Building on existing per-runtime primitives
+Each runtime already exposes adjacent delay signals; the implementation extends these rather than introducing duplicate mechanisms:
+*   **Go**: `stats.DelayedPickComplete` already marks the *end* of a blocked pick; the attempt-level delay generalizes it with a start signal and the `delay_type`/`delay_reason` payload. The existing attempt-scoped stats events have no hook that spans attempts or precedes the first attempt, so the call-scoped `"resolving"` hooks require a call-scoped tracer; gRPC-Go exposes this through a call-scoped tracer in its evolving stats-handler surface (the broader evolution of that surface is out of scope here beyond the delay hooks it must expose).
+*   **Java**: name-resolution delay is already measured and surfaced via the `ClientStreamTracer.NAME_RESOLUTION_DELAYED` call option and the `createPendingStream()` callback; the `"resolving"` call-delay hooks build on that pending-stream path. Note also that while an RPC is buffered waiting on a pick, no attempt-level `ClientStreamTracer` instance exists yet, so a buffered-pick (`"connecting"`) delay is anchored on the call-scoped `Factory` until the stream is created.
+*   **C++ (Core)**: core already records `"Delayed name resolution complete."` and `"Delayed LB pick complete."` as free-form string annotations; these are replaced by the structured `DelayAnnotation` below.
 
-// HandlerV2 is the factory interface that telemetry plugins implement.
-// It instantiates stateful, scoped tracers for calls, attempts, and connections.
-//
-// Experimental: this interface is experimental and subject to change.
-type HandlerV2 interface {
-	// NewCallTracer instantiates a CallTracer to monitor a client-side overall RPC call.
-	// The returned context is used throughout the lifetime of the call.
-	NewCallTracer(ctx context.Context, info *CallInfo) (context.Context, CallTracer)
-
-	// NewAttemptTracer instantiates an AttemptTracer to monitor an individual RPC stream attempt.
-	// The returned context is used throughout the lifetime of the attempt.
-	NewAttemptTracer(ctx context.Context, info *AttemptInfo) (context.Context, AttemptTracer)
-
-	// NewConnTracer instantiates a ConnTracer to monitor a physical transport connection.
-	// The returned context is used throughout the lifetime of the connection.
-	NewConnTracer(ctx context.Context, info *ConnInfo) (context.Context, ConnTracer)
-}
-
-// CallTracer is a call-scoped interface tracking the overall client RPC call.
-//
-// Experimental: this interface is experimental and subject to change.
-type CallTracer interface {
-	// RecordDelayStart indicates the start of a call-level delay (e.g., "resolving").
-	RecordDelayStart(delayType string, reason string)
-	// RecordDelayReasonChanged indicates a transition in the call-level delay reason.
-	RecordDelayReasonChanged(reason string)
-	// RecordDelayEnd indicates the end of the call-level delay.
-	RecordDelayEnd()
-	// OnCallEnd is called when the overall RPC call completes.
-	OnCallEnd(err error)
-}
-
-// AttemptTracer is an attempt-scoped interface tracking an individual stream attempt.
-//
-// Experimental: this interface is experimental and subject to change.
-type AttemptTracer interface {
-	// RecordDelayStart indicates the start of an attempt-level delay (e.g., "connecting").
-	RecordDelayStart(delayType string, reason string)
-	// RecordDelayReasonChanged indicates a transition in the attempt-level delay reason.
-	RecordDelayReasonChanged(reason string)
-	// RecordDelayEnd indicates the end of the attempt-level delay.
-	RecordDelayEnd()
-	
-	// OnHeaderSent/OnHeaderRecv replace V1 OutHeader and InHeader.
-	OnHeaderSent(compression string, md metadata.MD)
-	OnHeaderRecv(wireLength int, compression string, md metadata.MD)
-	
-	// OnPayloadSent/OnPayloadRecv replace V1 OutPayload and InPayload.
-	OnPayloadSent(payload any, length, compressedLength, wireLength int, sentTime time.Time)
-	OnPayloadRecv(payload any, length, compressedLength, wireLength int, recvTime time.Time)
-	
-	// OnTrailerSent/OnTrailerRecv replace V1 OutTrailer and InTrailer.
-	OnTrailerSent(md metadata.MD)
-	OnTrailerRecv(wireLength int, md metadata.MD)
-	
-	// OnAttemptEnd is called when this specific stream attempt completes (replacing V1 End).
-	OnAttemptEnd(err error)
-}
-
-// ConnTracer is a connection-scoped interface tracking physical transport connections.
-type ConnTracer interface {
-	// OnConnEnd is called when the transport connection terminates (replacing V1 ConnEnd).
-	OnConnEnd()
-}
-
-// Supporting Metadata Structs
-type CallInfo struct {
-	FullMethodName string
-	FailFast       bool
-	IsClientStream bool
-	IsServerStream bool
-}
-
-type AttemptInfo struct {
-	FullMethodName     string
-	IsTransparentRetry bool
-	IsHedged           bool
-	PreviousAttempts   int
-	RemoteAddr         net.Addr
-	LocalAddr          net.Addr
-}
-
-type ConnInfo struct {
-	RemoteAddr net.Addr
-	LocalAddr  net.Addr
-}
-```
-
-###### 2. Coexistence & Migration Strategy
-During the experimental phase, gRPC-Go will support both V1 and V2 interfaces concurrently to avoid breaking existing ecosystems (such as OpenCensus and older OpenTelemetry plugins):
-*   **Registration**: The channel option `grpc.WithStatsHandler()` will accept both `Handler` (V1) and `HandlerV2` (V2) types using interface checks.
-*   **Adaptation**: An internal adapter will be provided to wrap a V1 `Handler` into a V2 `HandlerV2` (converting method callbacks back into struct events and dispatching them to `HandleRPC`), ensuring older plugins continue to function.
-*   **Native Performance**: If a native V2 handler is registered (such as the new OpenTelemetry stats handler), the channel will bypass all V1 event struct allocations and type-assertions, running completely on the high-performance, zero-allocation callback path.
-
-##### Java
-In `io.grpc.ClientStreamTracer` and `ClientStreamTracer.Factory`:
-*Note: Call-level delays (like name resolution) occur before an attempt is created. Because `ClientStreamTracer` is attempt-scoped, the call-level delay APIs are added to `ClientStreamTracer.Factory` (which is call-scoped and plumbed throughout the channel), while the attempt-level delay APIs remain on the `ClientStreamTracer` instance.*
-```java
-package io.grpc;
-
-public abstract class ClientStreamTracer extends StreamTracer {
-  /**
-   * Called when an attempt-level delay segment (e.g. LB Pick connection) starts.
-   */
-  public void recordAttemptDelayStart(String delayType, String delayReason) {}
-
-  /**
-   * Called when an attempt-level delay reason changes.
-   */
-  public void recordAttemptDelayReasonChanged(String delayReason) {}
-
-  /**
-   * Called when an attempt-level delay segment ends.
-   */
-  public void recordAttemptDelayEnd() {}
-}
-
-// Nested inside ClientStreamTracer:
-public static abstract class Factory {
-  /**
-   * Called when a call-level delay segment (e.g. name resolution) starts.
-   */
-  public void recordCallDelayStart(String delayType, String delayReason) {}
-
-  /**
-   * Called when a call-level delay reason changes.
-   */
-  public void recordCallDelayReasonChanged(String delayReason) {}
-
-  /**
-   * Called when a call-level delay segment ends.
-   */
-  public void recordCallDelayEnd() {}
-
-  public abstract ClientStreamTracer newClientStreamTracer(StreamInfo info, Metadata headers);
-}
-```
-
-##### C++ (Core)
-In `src/core/telemetry/call_tracer.h`:
-*Note: To prevent core interface bloat and align with the core thinning refactoring, we leverage the existing C++ Annotation framework rather than adding new virtual methods.*
+###### Illustrative binding: C++ structured annotation
+To avoid adding new virtual methods to the core tracer interface, the delay transition is carried as an `Annotation` subtype on the existing annotation framework. It implements **both** pure-virtual hooks of the base `Annotation` — `ToString()` (human-readable form) and `ForEachKeyValue()` (structured `grpc.delay_type`/`grpc.delay_reason` pairs) — and **owns** its strings so the annotation may safely outlive the stack frame that produced it:
 ```cpp
 namespace grpc_core {
 
 class DelayAnnotation final : public CallTracerAnnotationInterface::Annotation {
  public:
   enum class Stage { kStart, kReasonChanged, kEnd };
-  
+
   DelayAnnotation(Stage stage, absl::string_view type, absl::string_view reason)
       : Annotation(CallTracerAnnotationInterface::AnnotationType::kDelay),
-        stage_(stage), type_(type), reason_(std::string(reason)) {}
-        
+        stage_(stage), type_(type), reason_(reason) {}
+
   Stage stage() const { return stage_; }
   absl::string_view type() const { return type_; }
   absl::string_view reason() const { return reason_; }
 
+  // Both overrides are required: the base Annotation declares them pure-virtual.
+  std::string ToString() const override;
+  void ForEachKeyValue(
+      absl::FunctionRef<void(absl::string_view, ValueType)> callback)
+      const override;
+
  private:
   Stage stage_;
-  absl::string_view type_;
-  std::string reason_;
+  std::string type_;    // owned (not a string_view) to avoid a dangling view
+  std::string reason_;  // owned
 };
 
-} // namespace grpc_core
+}  // namespace grpc_core
 ```
+A new `AnnotationType::kDelay` is added to the annotation-type enum (before the trailing `kDoNotUse_MustBeLast` sentinel). Plugins consume the structured fields via `ForEachKeyValue` to populate span attributes; plugins that only call `ToString()` continue to work unchanged. Making the structured labels observable does require the OpenTelemetry plugin to read `kDelay` via `ForEachKeyValue` — a `ToString()`-only path would otherwise collapse `delay_type` and `delay_reason` into one opaque string and lose the metric-label/diagnostic separation this design depends on.
 
 ### Feature Flag
 
 
 All delay metrics, tracing, and API hooks will be guarded by a feature flag:
 * **Go/Java Env Var**: `GRPC_EXPERIMENTAL_ENABLE_DELAY_OBSERVABILITY` (Default: `false`)
-* **C++ Core Experiment**: `IsExperimentEnabled("client_delay_observability")` (registered in `experiments.h`)
+* **C++ Core Experiment**: register `client_delay_observability` in `experiments.yaml`; gate via the generated `IsClientDelayObservabilityEnabled()` accessor (core uses generated per-experiment accessors, not string-keyed lookups).
 
 ## Metric Registration and Recording
 
