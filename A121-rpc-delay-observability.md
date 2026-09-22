@@ -3,7 +3,7 @@ A121: RPC Delay Observability
 * Author(s): Madhav Bissa (@mbissa)
 * Approver: @markdroth, @ejona86, @dfawley, @easwars
 * Implemented in: Go, Java, C++
-* Last updated: 2026-09-15
+* Last updated: 2026-09-22
 * Discussion at: https://groups.google.com/g/grpc-io/c/NsxXJ2MxXM4
 
 ## Abstract
@@ -57,7 +57,6 @@ A delay begins when the channel starts waiting and ends when the wait resolves, 
 
 ### Metric Schema
 
-All metrics added in this proposal will start as experimental and therefore off by default. The long term goal will be to de-experimentalize them and have them be on by default, but the exact criteria for that change are TBD.
 The following client-side per-call metrics are registered, extending the instrumentation framework defined in [gRFC A66][A66].
 
 #### Call Delay Duration Histogram
@@ -111,15 +110,15 @@ The channel records delays by calling three new methods on the call tracer. The 
 
 | Method | Called when |
 |---|---|
-| `RecordDelayStart(delay_type, reason)` | a delay begins, or the `delay_type` changes (which ends the previous delay and starts a new one) |
+| `RecordDelayStart(delay_type, reason)` | a delay begins, or the `delay_type` changes (after calling `RecordDelayEnd(delay_type)` for the previous delay type) |
 | `RecordDelayReasonChanged(delay_type, reason)` | the reason changes within the same `delay_type` |
-| `RecordDelayEnd(delay_type)` | the delay resolves |
+| `RecordDelayEnd(delay_type)` | the delay resolves or the `delay_type` changes (followed by RecordDelayStart) |
 
-**Caller (channel) responsibilities.** The channel is the single owner of the current `delay_type`: it stores it, chooses the `delay_type` and `delay_reason`, and passes the `delay_type` on every call so the call tracer never has to store it. It calls `RecordDelayStart` when a `delay_type` first appears or changes, `RecordDelayReasonChanged` when only the reason changes, and `RecordDelayEnd` when the delay resolves. The scope — and therefore which histogram the delay is recorded to (see [Metric Schema](#metric-schema)) — is chosen by whether the channel calls the method on the call-scoped or the attempt-scoped tracer.
+**Caller (channel) responsibilities.** The channel is the single owner of the current `delay_type`: it stores it, chooses the `delay_type` and `delay_reason`, and passes the `delay_type` on every call so the call tracer never has to store it. It calls `RecordDelayStart` when a `delay_type` first appears or changes (in which case the channel ends the previous delay first with a call to `RecordDelayEnd`), `RecordDelayReasonChanged` when only the reason changes, and `RecordDelayEnd` when the delay resolves. The scope — and therefore which histogram the delay is recorded to (see [Metric Schema](#metric-schema)) — is chosen by whether the channel calls the method on the call-scoped or the attempt-scoped tracer.
 
-**Call tracer (telemetry plugin) responsibilities.** On `RecordDelayStart`, the plugin opens the `Delay` span (see [Tracing Schema](#tracing-schema)) and records the delay type and start time of the delay. On `RecordDelayReasonChanged`, it adds a `Delay triggered` event. On `RecordDelayEnd`, it closes the span and records the elapsed duration to the histogram identified by the supplied `delay_type`. Because `delay_type` is supplied on every call, the plugin does not need to store it, and the plugin owns timing (the methods carry no duration argument).
+**Call tracer (telemetry plugin) responsibilities.** On `RecordDelayStart`, the plugin opens the `Delay` span (see [Tracing Schema](#tracing-schema)) and records the delay type and start time of the delay. Further, it also records the initial reason with a `Delay triggered` event. On `RecordDelayReasonChanged`, it adds another `Delay triggered` event with the new reason. On `RecordDelayEnd`, it closes the span and records the elapsed duration to the histogram identified by the supplied `delay_type`. Because `delay_type` is supplied on every call, the plugin does not need to store it, and the plugin owns timing (the methods carry no duration argument).
 
-**Cancellation and deadlines.** The channel already notifies the call tracer when an RPC is cancelled or reaches its deadline. If a delay is open at that point, the call tracer automatically terminates it — closing the span and recording the partial duration — so the channel does not need to explicitly end open delays on these paths.
+**Cancellation and deadlines.** The channel must end any open delay when the RPC stops waiting, not only when the wait resolves successfully. This includes the RPC being cancelled or reaching its deadline. The channel calls `RecordDelayEnd(delay_type)` for the delay that is currently open, on the tracer that delay was started on; if no delay is open, no call is made. The duration recorded in these cases is the partial duration up to that point.
 
 **Per-language binding.** These methods bind onto each runtime's existing telemetry types:
 
@@ -191,11 +190,11 @@ These pass-through container policies do not modify the metric `delay_type`; the
 
 #### Channel Behavior for LB Pick Delays
 
-For picker-generated delays, the channel reads the queued pick's `delay_type` and `delay_reason` and drives the call tracer per the [Call Tracer API](#call-tracer-api-changes): `RecordDelayStart` when the `delay_type` first appears or changes, `RecordDelayReasonChanged` when only the reason changes, and `RecordDelayEnd` when a pick assigns a ready subchannel.
+For picker-generated delays, the channel reads the queued pick's `delay_type` and `delay_reason` and drives the call tracer per the [Call Tracer API](#call-tracer-api-changes): `RecordDelayStart` when the `delay_type` first appears or changes (in which case the channel ends the previous delay first with a call to `RecordDelayEnd`), `RecordDelayReasonChanged` when only the reason changes, and `RecordDelayEnd` when a pick assigns a ready subchannel.
 
 The channel additionally synthesizes two attempt-level delay types itself, keeping pickers ignorant of `wait_for_ready` semantics and transport-level races:
 
-*   **`picker_failing_with_wait_for_ready`**: When the picker returns a failing result (an error other than "no connection available") and the RPC is `wait_for_ready`, the channel queues the RPC and records this delay type, with the picker's error as the reason. (If the RPC is not `wait_for_ready`, it fails immediately and no delay is recorded.) The delay ends when a subsequent picker assigns a ready subchannel; if a queued RPC continues to see errors, the channel updates the reason. If the RPC is cancelled or reaches its deadline while queued, the call tracer terminates the open delay automatically.
+*   **`picker_failing_with_wait_for_ready`**: When the picker returns a failing result (an error other than "no connection available") and the RPC is `wait_for_ready`, the channel queues the RPC and records this delay type, with the picker's error as the reason. (If the RPC is not `wait_for_ready`, it fails immediately and no delay is recorded.) The delay ends when a subsequent picker assigns a ready subchannel; if a queued RPC continues to see errors, the channel updates the reason.
 
 *   **`subchannel_state_mismatch`**: When the picker returns a ready subchannel but it has transitioned out of `READY` before the RPC can use it (a race before the picker is updated), the channel re-queues the RPC on the same attempt and records this delay type. It waits for the next picker and re-picks; no new attempt is created. The delay ends when a re-pick assigns a subchannel that is actually ready.
 
